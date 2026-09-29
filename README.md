@@ -7,7 +7,7 @@ A minimal test case that shows Propeller and the `DeduBB` CodeGen pass finding i
 | Kind | Block shape | Directives |
 |---|---|---|
 | **Tail call** | ends in a return or tail call | `bbm` / `bbf` |
-| **Save-and-Jump** | one successor | `bbmsj` / `bbfsj` |
+| **Save-and-Jump** | ends in a unconditional branch | `bbmsj` / `bbfsj` |
 | **Two-exit Save-and-Jump** | ends in a conditional branch | `bbmsj2` / `bbfsj2` |
 
 ```asm
