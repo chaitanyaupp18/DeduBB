@@ -1,14 +1,36 @@
 # DeduBB: Cross-Module Reproducibility Guide
 
-This document provides a minimal, reproducible test case to verify that Propeller and the `DeduBB` CodeGen pass find identical basic blocks in different modules and fold them. It covers all three kinds of fold:
+A minimal test case that shows Propeller and the `DeduBB` CodeGen pass finding identical basic blocks in different modules and folding every duplicate into one shared copy, the **master**.
 
-| Fold | Duplicate block | The duplicate becomes | The master ends with |
-|---|---|---|---|
-| Tail call (`bbm` / `bbf`) | ends in a return or tail call | `jmp DeduBB.master.K` | its own `ret` |
-| Save-and-Jump (`bbmsj` / `bbfsj`) | has one successor (falls through or ends in `jmp`) | `lea Succ(%rip),%r11`<br>`jmp DeduBB.master.sj.K` | `jmp *%r11` |
-| Two-exit Save-and-Jump (`bbmsj2` / `bbfsj2`) | ends in a conditional branch | `lea Taken(%rip),%r11`<br>`lea NotTaken(%rip),%r10`<br>`jmp DeduBB.master.sj2.K` | `j<cc> 1f`<br>`jmp *%r10`<br>`1: jmp *%r11` |
+## How blocks are folded
 
-A Save-and-Jump fold passes the addresses to continue at in registers, so the stack and the frame of the folded function are never touched: the master runs in the folded function's frame and jumps back to that function's own successor.
+| Kind | Block shape | Directives |
+|---|---|---|
+| **Tail call** | ends in a return or tail call | `bbm` / `bbf` |
+| **Save-and-Jump** | one successor | `bbmsj` / `bbfsj` |
+| **Two-exit Save-and-Jump** | ends in a conditional branch | `bbmsj2` / `bbfsj2` |
+
+```asm
+# Tail call: the master's own `ret` returns for the duplicate.
+duplicate:  jmp   DeduBB.master.K
+
+# Save-and-Jump: the duplicate passes its successor in %r11.
+duplicate:  lea   Succ(%rip), %r11
+            jmp   DeduBB.master.sj.K
+master:     ...                          # the shared block
+            jmp   *%r11                  # continue at the duplicate's successor
+
+# Two-exit Save-and-Jump: both successors travel in registers.
+duplicate:  lea   Taken(%rip), %r11
+            lea   NotTaken(%rip), %r10
+            jmp   DeduBB.master.sj2.K
+master:     ...                          # the shared block, same condition
+            j<cc> 1f
+            jmp   *%r10                  # branch not taken
+1:          jmp   *%r11                  # branch taken
+```
+
+Folds never touch the stack: the master runs in the duplicate's frame and continues exactly where the duplicate would have.
 
 ## 1. The Test Case (Before & After Assembly)
 
