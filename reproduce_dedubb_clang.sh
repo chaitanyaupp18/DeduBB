@@ -1,11 +1,19 @@
 #!/bin/bash
 
-## Standalone Evaluation Framework for Cross-Module Tail-Call Deduplication
-## 
+## Standalone Evaluation Framework for Cross-Module Basic-Block Deduplication (DeduBB)
+##
 ## This script automatically clones LLVM and Propeller, applies the DeduBB patches,
-## and compiles a pristine LLVM compiler to evaluate the deduplication savings.
+## and compiles a pristine LLVM compiler to evaluate the deduplication savings
+## (tail-call folds, and one- and two-exit Save-and-Jump folds).
+##
+## Both clang builds (the BBAddrMap baseline and the DeduBB build) are optimized for
+## size: -Oz, one section per function and datum, --gc-sections and --icf=all. The
+## savings reported are on top of those. Run with DEDUBB_SIZE_OPT=0 to use the plain
+## Release (-O3) flags instead.
 
 set -eux
+
+DEDUBB_SIZE_OPT=${DEDUBB_SIZE_OPT:-1}
 
 CWD="$(pwd)"
 BASE_DIR=${CWD}/clang_dedubb_binaries
@@ -68,12 +76,29 @@ COMMON_CMAKE_FLAGS=(
   "-DLLVM_USE_LINKER=lld"
   "-DLLVM_ENABLE_LTO=Thin" )
 
+# Size optimization. The baseline and the DeduBB build must use the same flags,
+# since the DeduBB directives name the baseline's basic blocks.
+#   -Oz replaces Release's -O3 (the ThinLTO backend in lld honors it too).
+#   LLVM's CMake already adds -ffunction-sections -fdata-sections to Release builds;
+#   they are repeated here to keep the flag set explicit. clang itself is linked
+#   without --gc-sections by default (it keeps symbols for plugins), so it is
+#   added, together with identical code folding.
+SIZE_CFLAGS=""
+SIZE_LDFLAGS=""
+if [[ "${DEDUBB_SIZE_OPT}" == 1 ]]; then
+  COMMON_CMAKE_FLAGS+=(
+    "-DCMAKE_C_FLAGS_RELEASE=-Oz -DNDEBUG"
+    "-DCMAKE_CXX_FLAGS_RELEASE=-Oz -DNDEBUG" )
+  SIZE_CFLAGS="-ffunction-sections -fdata-sections"
+  SIZE_LDFLAGS="-Wl,--gc-sections -Wl,--icf=all"
+fi
+
 INSTRUMENTED_PROPELLER_CC_LD_CMAKE_FLAGS=(
-  "-DCMAKE_C_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
-  "-DCMAKE_CXX_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
-  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
-  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
-  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map" )
+  "-DCMAKE_C_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map ${SIZE_CFLAGS}"
+  "-DCMAKE_CXX_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map ${SIZE_CFLAGS}"
+  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}"
+  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}"
+  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}" )
 
 PATH_TO_BBADDRMAP_CLANG_BUILD=${BASE_DIR}/bbaddrmap_clang_build
 mkdir -p ${PATH_TO_BBADDRMAP_CLANG_BUILD} && cd ${PATH_TO_BBADDRMAP_CLANG_BUILD}
@@ -81,18 +106,17 @@ cmake -G Ninja "${COMMON_CMAKE_FLAGS[@]}" "${INSTRUMENTED_PROPELLER_CC_LD_CMAKE_
 ninja clang
 
 # 6. Generate DeduBB Directives
-/usr/bin/time -v ${PATH_TO_GENERATE_PROFILES} --binary=${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} --tail_call_profile=${PATH_TO_PROFILES}/dedubb_directives.txt 2> ${PATH_TO_ALL_RESULTS}/mem_propeller_dedup_conversion.txt
+# With --icf=all, functions the linker merged share one address under several names.
+# Propeller leaves those alone (--dedubb_skip_aliased_functions, on by default), so
+# the DeduBB build does not stop the linker from merging them again.
+/usr/bin/time -v ${PATH_TO_GENERATE_PROFILES} --binary=${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} --dedubb_profile=${PATH_TO_PROFILES}/dedubb_directives.txt 2> ${PATH_TO_ALL_RESULTS}/mem_propeller_dedup_conversion.txt
 
 # 7. Build DeduBB Optimized Clang
+# Same flags as the baseline, plus the patch's CLANG_DEDUBB_DIRECTIVES option, which
+# applies the directives to the clang executable's link only.
 OPTIMIZED_DEDUBB_CC_LD_CMAKE_FLAGS=(
-  "-DCMAKE_C_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
-  "-DCMAKE_CXX_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map"
-  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
-  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map"
-  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map" )
-
-# Patch clang's CMakeLists.txt to apply DeduBB directives ONLY to the clang executable link
-sed -i "s|target_link_libraries(clang PRIVATE.*|target_link_libraries(clang PRIVATE \"-Wl,-mllvm,-dedubb-directives=${PATH_TO_PROFILES}/dedubb_directives.txt\")|" ${PATH_TO_LLVM_SOURCES}/llvm-project/clang/tools/driver/CMakeLists.txt
+  "${INSTRUMENTED_PROPELLER_CC_LD_CMAKE_FLAGS[@]}"
+  "-DCLANG_DEDUBB_DIRECTIVES=${PATH_TO_PROFILES}/dedubb_directives.txt" )
 
 PATH_TO_OPTIMIZED_DEDUBB_BUILD=${BASE_DIR}/optimized_dedubb_build
 mkdir -p ${PATH_TO_OPTIMIZED_DEDUBB_BUILD} && cd ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}
@@ -102,8 +126,10 @@ ninja clang
 # 8. Measure Sizes
 printf "Baseline BBAddrMap Stats\n" > ${BASE_DIR}/Results/sizes_clang_dedup.txt
 ${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size ${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
+${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size -A ${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} | grep '^\.text ' >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
 
 printf "\nDeduBB Optimized Stats\n" >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
 ${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION} >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
+${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size -A ${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION} | grep '^\.text ' >> ${BASE_DIR}/Results/sizes_clang_dedup.txt
 
 cat ${BASE_DIR}/Results/sizes_clang_dedup.txt

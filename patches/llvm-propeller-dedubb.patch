@@ -1,8 +1,8 @@
 diff --git a/propeller/BUILD b/propeller/BUILD
-index 1f64add..be07a9a 100644
+index 1f64add..999aac2 100644
 --- a/propeller/BUILD
 +++ b/propeller/BUILD
-@@ -991,6 +991,41 @@ cc_library(
+@@ -991,6 +991,62 @@ cc_library(
      ],
  )
  
@@ -10,6 +10,23 @@ index 1f64add..be07a9a 100644
 +    name = "tail_call_dedupper",
 +    srcs = ["tail_call_dedupper.cc"],
 +    hdrs = ["tail_call_dedupper.h"],
++)
++
++cc_library(
++    name = "save_and_jump_dedupper",
++    srcs = ["save_and_jump_dedupper.cc"],
++    hdrs = ["save_and_jump_dedupper.h"],
++    deps = [":tail_call_dedupper"],
++)
++
++cc_test(
++    name = "save_and_jump_dedupper_test",
++    srcs = ["save_and_jump_dedupper_test.cc"],
++    deps = [
++        ":save_and_jump_dedupper",
++        ":tail_call_dedupper",
++        "@com_google_googletest//:gtest_main",
++    ],
 +)
 +
 +cc_test(
@@ -29,14 +46,18 @@ index 1f64add..be07a9a 100644
 +        ":bb_addr_map",
 +        ":bb_addr_map_cc_proto",
 +        ":binary_content",
++        ":mini_disassembler",
 +        ":propeller_options_cc_proto",
 +        ":status_macros",
++        ":save_and_jump_dedupper",
 +        ":tail_call_dedupper",
 +        "@abseil-cpp//absl/log",
 +        "@abseil-cpp//absl/status",
 +        "@abseil-cpp//absl/status:statusor",
 +        "@abseil-cpp//absl/strings:str_format",
++        "@llvm-project//llvm:MC",
 +        "@llvm-project//llvm:Object",
++        "@llvm-project//llvm:Support",
 +        "@llvm-project//llvm:TargetParser",
 +    ],
 +)
@@ -44,7 +65,7 @@ index 1f64add..be07a9a 100644
  cc_library(
      name = "profile_generator",
      srcs = ["profile_generator.cc"],
-@@ -1013,6 +1048,7 @@ cc_library(
+@@ -1013,6 +1069,7 @@ cc_library(
          ":propeller_options_cc_proto",
          ":proto_branch_frequencies_aggregator",
          ":status_macros",
@@ -52,7 +73,7 @@ index 1f64add..be07a9a 100644
          "@abseil-cpp//absl/algorithm:container",
          "@abseil-cpp//absl/container:flat_hash_set",
          "@abseil-cpp//absl/log",
-@@ -1042,6 +1078,7 @@ cc_binary(
+@@ -1042,6 +1099,7 @@ cc_binary(
      deps = [
          ":profile_generator",
          ":propeller_options_cc_proto",
@@ -61,19 +82,25 @@ index 1f64add..be07a9a 100644
          "@abseil-cpp//absl/container:flat_hash_map",
          "@abseil-cpp//absl/flags:flag",
 diff --git a/propeller/CMakeLists.txt b/propeller/CMakeLists.txt
-index a7a055a..818b1b8 100644
+index a7a055a..d1b7cd4 100644
 --- a/propeller/CMakeLists.txt
 +++ b/propeller/CMakeLists.txt
-@@ -54,6 +54,8 @@ add_library(propeller_lib OBJECT
+@@ -53,7 +53,10 @@ add_library(propeller_lib OBJECT
+   propeller_statistics.cc
    proto_branch_frequencies_aggregator.cc
    resolve_mmap_name.cc
++  save_and_jump_dedupper.cc
    spe_tid_pid_provider.cc
 +  tail_call_dedupper.cc
 +  tail_call_profile_writer.cc
    # keep-sorted end
  )
  target_link_libraries(propeller_lib
-@@ -124,6 +126,7 @@ propeller_generate_tests(
+@@ -121,9 +124,11 @@ propeller_generate_tests(
+     program_cfg_path_analyzer_test.cc
+     propeller_statistics_test.cc
+     proto_branch_frequencies_aggregator_test.cc
++    save_and_jump_dedupper_test.cc
      spe_tid_pid_provider_test.cc
      status_macros_test.cc
      status_testing_macros_test.cc
@@ -82,10 +109,29 @@ index a7a055a..818b1b8 100644
    DEPS
      # keep-sorted start
 diff --git a/propeller/generate_propeller_profiles.cc b/propeller/generate_propeller_profiles.cc
-index 34c7b30..3ddde29 100644
+index 34c7b30..b5a9db9 100644
 --- a/propeller/generate_propeller_profiles.cc
 +++ b/propeller/generate_propeller_profiles.cc
-@@ -42,6 +42,7 @@
+@@ -29,6 +29,13 @@
+ //     --cc_profile=sample_cc_profile.txt \
+ //     --ld_profile=sample_ld_profile.txt
+ // ```
++//
++// DeduBB directives need no profile:
++// ```
++//   ./generate_propeller_profiles \
++//     --binary=sample.bin \
++//     --dedubb_profile=dedubb_directives.txt
++// ```
+ 
+ #include <string>
+ #include <vector>
+@@ -38,10 +45,12 @@
+ #include "absl/flags/parse.h"
+ #include "absl/flags/usage.h"
+ #include "absl/log/check.h"
++#include "absl/log/log.h"
+ #include "absl/strings/str_cat.h"
  #include "absl/strings/string_view.h"
  #include "propeller/profile_generator.h"
  #include "propeller/propeller_options.pb.h"
@@ -93,43 +139,70 @@ index 34c7b30..3ddde29 100644
  #include "propeller/text_proto_flag.h"
  
  namespace {
-@@ -65,6 +66,16 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
+@@ -65,6 +74,28 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
            "\"PERF_SPE\", \"FREQUENCIES_PROTO\").");
  ABSL_FLAG(std::string, cc_profile, "", "Output cc profile");
  ABSL_FLAG(std::string, ld_profile, "", "Output ld profile");
++ABSL_FLAG(std::string, dedubb_profile, "",
++          "Output DeduBB directive file. Scans the binary for byte-identical "
++          "basic blocks and writes tail-call (`bbm`/`bbf`), Save-and-Jump "
++          "(`bbmsj`/`bbfsj`) and two-exit Save-and-Jump (`bbmsj2`/`bbfsj2`) "
++          "directives. Does not require a perf profile.");
++ABSL_FLAG(bool, dedubb_cold_only, false,
++          "Restrict DeduBB to cold basic blocks (zero post-link frequency) to "
++          "preserve hot-path performance.");
++ABSL_FLAG(bool, dedubb_intra_module_only, false,
++          "Restrict DeduBB to blocks within the same module.");
++ABSL_FLAG(bool, dedubb_skip_aliased_functions, true,
++          "Leave alone functions whose address carries more than one symbol "
++          "name (aliases, or functions merged by identical code folding such "
++          "as --icf=all), so DeduBB never stops the linker from merging them.");
++// Deprecated spellings of the three flags above, from when DeduBB only folded
++// tail calls. They still work, with a warning.
 +ABSL_FLAG(std::string, tail_call_profile, "",
-+          "Output DeduBB tail-call deduplication directive file (the "
-+          "`m`/`f`/`bbm`/`bbf` directives). Scans the binary for byte-identical "
-+          "basic blocks ending in a tail call or return. Does not require a "
-+          "perf profile.");
++          "Deprecated: use --dedubb_profile.");
 +ABSL_FLAG(bool, tail_call_dedup_cold_only, false,
-+          "Restrict tail-call deduplication to cold basic blocks (zero "
-+          "post-link frequency) to preserve hot-path performance.");
++          "Deprecated: use --dedubb_cold_only.");
 +ABSL_FLAG(bool, tail_call_dedup_intra_module_only, false,
-+          "Restrict tail-call deduplication to blocks within the same module.");
++          "Deprecated: use --dedubb_intra_module_only.");
  ABSL_FLAG(propeller::TextProtoFlag<propeller::PropellerOptions>,
            propeller_options, {},
            "Override for propeller options (debug only).");
-@@ -122,6 +133,11 @@ int main(int argc, char* argv[]) {
+@@ -122,6 +153,26 @@ int main(int argc, char* argv[]) {
    options.set_binary_name(absl::GetFlag(FLAGS_binary));
    options.set_cluster_out_name(absl::GetFlag(FLAGS_cc_profile));
    options.set_symbol_order_out_name(absl::GetFlag(FLAGS_ld_profile));
-+  options.set_tail_call_profile_out_name(absl::GetFlag(FLAGS_tail_call_profile));
-+  options.set_tail_call_dedup_cold_only(
-+      absl::GetFlag(FLAGS_tail_call_dedup_cold_only));
-+  options.set_tail_call_dedup_intra_module_only(
++  std::string dedubb_profile = absl::GetFlag(FLAGS_dedubb_profile);
++  if (!absl::GetFlag(FLAGS_tail_call_profile).empty()) {
++    LOG(WARNING) << "--tail_call_profile is deprecated; use --dedubb_profile";
++    if (dedubb_profile.empty())
++      dedubb_profile = absl::GetFlag(FLAGS_tail_call_profile);
++  }
++  if (absl::GetFlag(FLAGS_tail_call_dedup_cold_only))
++    LOG(WARNING) << "--tail_call_dedup_cold_only is deprecated; use "
++                    "--dedubb_cold_only";
++  if (absl::GetFlag(FLAGS_tail_call_dedup_intra_module_only))
++    LOG(WARNING) << "--tail_call_dedup_intra_module_only is deprecated; use "
++                    "--dedubb_intra_module_only";
++  options.set_dedubb_profile_out_name(dedubb_profile);
++  options.set_dedubb_cold_only(absl::GetFlag(FLAGS_dedubb_cold_only) ||
++                               absl::GetFlag(FLAGS_tail_call_dedup_cold_only));
++  options.set_dedubb_intra_module_only(
++      absl::GetFlag(FLAGS_dedubb_intra_module_only) ||
 +      absl::GetFlag(FLAGS_tail_call_dedup_intra_module_only));
++  options.set_dedubb_skip_aliased_functions(
++      absl::GetFlag(FLAGS_dedubb_skip_aliased_functions));
  
    for (const std::string& profile : absl::GetFlag(FLAGS_profile)) {
      InputProfile* input_profile = options.add_input_profiles();
-@@ -130,5 +146,14 @@ int main(int argc, char* argv[]) {
+@@ -130,5 +181,14 @@ int main(int argc, char* argv[]) {
          ToProtoProfileType(absl::GetFlag(FLAGS_profile_type)));
    }
  
-+  // Tail-call deduplication is a static analysis of the binary and needs no
-+  // perf profile. When the user only asks for the DeduBB directive file (no
-+  // input profiles), emit it directly without running the profile pipeline.
-+  if (!options.tail_call_profile_out_name().empty() &&
++  // DeduBB is a static analysis of the binary and needs no perf profile. When
++  // the user only asks for the DeduBB directive file (no input profiles), emit
++  // it directly without running the profile pipeline.
++  if (!options.dedubb_profile_out_name().empty() &&
 +      options.input_profiles().empty()) {
 +    QCHECK_OK(propeller::WriteTailCallDedupProfile(options));
 +    return 0;
@@ -138,7 +211,7 @@ index 34c7b30..3ddde29 100644
    QCHECK_OK(GeneratePropellerProfiles(options));
  }
 diff --git a/propeller/mini_disassembler.cc b/propeller/mini_disassembler.cc
-index 5ba1b7c..bf773ca 100644
+index 5ba1b7c..1d59574 100644
 --- a/propeller/mini_disassembler.cc
 +++ b/propeller/mini_disassembler.cc
 @@ -90,8 +90,8 @@ MiniDisassembler::Create(const llvm::object::ObjectFile* object_file) {
@@ -152,6 +225,57 @@ index 5ba1b7c..bf773ca 100644
    disassembler->disasm_ = absl::WrapUnique(
        target->createMCDisassembler(*disassembler->sti_, *disassembler->ctx_));
    if (disassembler->disasm_ == nullptr)
+@@ -132,6 +132,17 @@ absl::StatusOr<llvm::MCInst> MiniDisassembler::DisassembleOne(
+       "no section containing address 0x%lx found", binary_address));
+ }
+ 
++absl::StatusOr<llvm::MCInst> MiniDisassembler::DisassembleOne(
++    llvm::ArrayRef<uint8_t> bytes, uint64_t binary_address, uint64_t& size) {
++  llvm::MCInst inst;
++  if (!disasm_->getInstruction(inst, size, bytes, binary_address,
++                               llvm::nulls())) {
++    return absl::FailedPreconditionError(absl::StrFormat(
++        "getInstruction failed at binary address 0x%lx", binary_address));
++  }
++  return inst;
++}
++
+ bool MiniDisassembler::MayAffectControlFlow(const llvm::MCInst& inst) {
+   return mii_->get(inst.getOpcode()).mayAffectControlFlow(inst, *mri_);
+ }
+diff --git a/propeller/mini_disassembler.h b/propeller/mini_disassembler.h
+index 377f5b9..9c7f258 100644
+--- a/propeller/mini_disassembler.h
++++ b/propeller/mini_disassembler.h
+@@ -20,6 +20,7 @@
+ 
+ #include "absl/base/nullability.h"
+ #include "absl/status/statusor.h"
++#include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/MC/MCAsmInfo.h"
+ #include "llvm/MC/MCContext.h"
+@@ -47,10 +48,20 @@ class MiniDisassembler {
+   MiniDisassembler& operator=(MiniDisassembler&&) = delete;
+ 
+   absl::StatusOr<llvm::MCInst> DisassembleOne(uint64_t binary_address);
++  // Disassembles the instruction at the start of `bytes`, which are located at
++  // `binary_address`, and stores its length in `size`. Unlike the overload
++  // above, this does not look up the containing section.
++  absl::StatusOr<llvm::MCInst> DisassembleOne(llvm::ArrayRef<uint8_t> bytes,
++                                              uint64_t binary_address,
++                                              uint64_t& size);
+   bool MayAffectControlFlow(const llvm::MCInst& inst);
+   llvm::StringRef GetInstructionName(const llvm::MCInst& inst) const;
+   absl::StatusOr<bool> MayAffectControlFlow(uint64_t binary_address);
+ 
++  const llvm::MCInstrInfo& instr_info() const { return *mii_; }
++  const llvm::MCRegisterInfo& register_info() const { return *mri_; }
++  const llvm::MCInstrAnalysis& instr_analysis() const { return *mia_; }
++
+  private:
+   explicit MiniDisassembler(const llvm::object::ObjectFile* object_file)
+       : object_file_(object_file) {}
 diff --git a/propeller/profile_generator.cc b/propeller/profile_generator.cc
 index 61f6643..89e9ea1 100644
 --- a/propeller/profile_generator.cc
@@ -175,7 +299,7 @@ index 61f6643..89e9ea1 100644
  }
  }  // namespace
 diff --git a/propeller/propeller_options.proto b/propeller/propeller_options.proto
-index 5be1683..03c13ba 100644
+index 5be1683..2c839c2 100644
 --- a/propeller/propeller_options.proto
 +++ b/propeller/propeller_options.proto
 @@ -33,7 +33,7 @@ message InputProfile {
@@ -187,25 +311,32 @@ index 5be1683..03c13ba 100644
  message PropellerOptions {
    // binary file name.
    string binary_name = 1;
-@@ -92,6 +92,21 @@ message PropellerOptions {
+@@ -92,6 +92,28 @@ message PropellerOptions {
  
    // Write the basic block hash in the cluster file.
    bool write_bb_hash = 18 [default = false];
 +
-+  // Output file for DeduBB tail-call deduplication directives (the `m`/`f`/
-+  // `bbm`/`bbf` directive file). When set, Propeller scans the binary for
-+  // byte-identical basic blocks that end in a tail call or return and emits the
-+  // directives consumed by the LLVM CodeGen DeduBB pass. Empty disables it.
-+  string tail_call_profile_out_name = 19;
++  // Output file for DeduBB directives. When set, Propeller scans the binary for
++  // byte-identical basic blocks and writes the directives consumed by the LLVM
++  // CodeGen DeduBB pass: tail-call folds (`bbm`/`bbf`), Save-and-Jump folds
++  // (`bbmsj`/`bbfsj`) and two-exit Save-and-Jump folds (`bbmsj2`/`bbfsj2`).
++  // Empty disables it.
++  string dedubb_profile_out_name = 19;
 +
-+  // When true, restrict tail-call deduplication to cold basic blocks (those with
-+  // a zero post-link frequency), preserving hot-path performance as in the
-+  // DeduBB paper. Requires a profile to be useful; with no profile every block
-+  // is considered cold. Defaults to false (deduplicate all tail/return blocks).
-+  bool tail_call_dedup_cold_only = 20 [default = false];
++  // When true, restrict DeduBB to cold basic blocks (those with a zero
++  // post-link frequency), preserving hot-path performance as in the DeduBB
++  // paper. Requires a profile to be useful; with no profile every block is
++  // considered cold. Defaults to false (consider every eligible block).
++  bool dedubb_cold_only = 20 [default = false];
 +
-+  // When true, restrict tail-call deduplication to blocks within the same module.
-+  bool tail_call_dedup_intra_module_only = 21 [default = false];
++  // When true, restrict DeduBB to blocks within the same module.
++  bool dedubb_intra_module_only = 21 [default = false];
++
++  // When true (the default), leave alone every function whose address carries
++  // more than one symbol name: an alias, or functions merged by identical code
++  // folding (e.g. `--icf=all`). Changing one of the merged copies would stop
++  // the linker from merging them again, which costs more than DeduBB saves.
++  bool dedubb_skip_aliased_functions = 22 [default = true];
  }
  
  // Next Available: 15.
@@ -417,10 +548,10 @@ index 0000000..69abcb7
 +}  // namespace propeller
 diff --git a/propeller/tail_call_dedupper.h b/propeller/tail_call_dedupper.h
 new file mode 100644
-index 0000000..fcd6c07
+index 0000000..a3ed2d7
 --- /dev/null
 +++ b/propeller/tail_call_dedupper.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,134 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -485,8 +616,17 @@ index 0000000..fcd6c07
 +  std::vector<uint8_t> bytes;  // Raw machine bytes of the block.
 +};
 +
-+// Kind of an emitted directive: `bbm` (master copy) or `bbf` (fold to master).
-+enum class DirectiveKind { kMaster, kFold };
++// Kind of an emitted directive: `bbm` (master copy) or `bbf` (fold to master),
++// and their Save-and-Jump (`bbmsj`/`bbfsj`) and two-exit Save-and-Jump
++// (`bbmsj2`/`bbfsj2`) forms.
++enum class DirectiveKind {
++  kMaster,
++  kFold,
++  kMasterSaveJump,
++  kFoldSaveJump,
++  kMasterSaveJump2,
++  kFoldSaveJump2
++};
 +
 +// One emitted directive line. A group of identical blocks produces exactly one
 +// `kMaster` directive (the retained copy, labelled `DeduBB.master.<master_id>`)
@@ -548,7 +688,7 @@ index 0000000..fcd6c07
 +#endif  // PROPELLER_TAIL_CALL_DEDUPPER_H_
 diff --git a/propeller/tail_call_dedupper_test.cc b/propeller/tail_call_dedupper_test.cc
 new file mode 100644
-index 0000000..31e46de
+index 0000000..208bb5f
 --- /dev/null
 +++ b/propeller/tail_call_dedupper_test.cc
 @@ -0,0 +1,159 @@
@@ -590,7 +730,7 @@ index 0000000..31e46de
 +TailCallBlock MakeBlock(std::string module, std::string function, uint32_t id,
 +                        uint64_t address, std::vector<uint8_t> bytes) {
 +  return TailCallBlock{std::move(module), std::move(function), id, address,
-+                       std::move(bytes)};
++                       /*frequency=*/0, std::move(bytes)};
 +}
 +
 +// Locks the FNV-1a constants against well-known reference vectors.
@@ -713,10 +853,10 @@ index 0000000..31e46de
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer.cc b/propeller/tail_call_profile_writer.cc
 new file mode 100644
-index 0000000..a42fec4
+index 0000000..eb6f3f9
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer.cc
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,550 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -733,10 +873,14 @@ index 0000000..a42fec4
 +
 +#include "propeller/tail_call_profile_writer.h"
 +
++#include <algorithm>
++#include <array>
 +#include <cstdint>
 +#include <fstream>
 +#include <memory>
++#include <optional>
 +#include <string>
++#include <unordered_map>
 +#include <utility>
 +#include <vector>
 +
@@ -744,14 +888,23 @@ index 0000000..a42fec4
 +#include "absl/status/status.h"
 +#include "absl/status/statusor.h"
 +#include "absl/strings/str_format.h"
++#include "llvm/ADT/ArrayRef.h"
 +#include "llvm/ADT/StringRef.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrAnalysis.h"
++#include "llvm/MC/MCInstrDesc.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegister.h"
++#include "llvm/MC/MCRegisterInfo.h"
 +#include "llvm/Object/ObjectFile.h"
 +#include "llvm/TargetParser/Triple.h"
 +#include "propeller/bb_addr_map.h"
 +#include "propeller/bb_addr_map.pb.h"
 +#include "propeller/binary_content.h"
++#include "propeller/mini_disassembler.h"
 +#include "propeller/propeller_options.pb.h"
 +#include "propeller/status_macros.h"  // Included for macros.
++#include "propeller/save_and_jump_dedupper.h"
 +#include "propeller/tail_call_dedupper.h"
 +
 +namespace propeller {
@@ -782,6 +935,10 @@ index 0000000..a42fec4
 +
 +}  // namespace
 +
++bool IsAliased(const FunctionBbAddrMapPb& function) {
++  return function.function_names_size() > 1;
++}
++
 +int TailCallPatchSize(const BinaryContent& binary_content) {
 +  switch (llvm::Triple::ArchType(binary_content.object_file->getArch())) {
 +    case llvm::Triple::x86:
@@ -801,11 +958,12 @@ index 0000000..a42fec4
 +
 +std::vector<TailCallBlock> BuildTailCallBlocks(
 +    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
-+    bool cold_only) {
++    bool cold_only, bool skip_aliased_functions) {
 +  std::vector<TailCallBlock> blocks;
 +  for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps()) {
 +    for (const FunctionBbAddrMapPb& function :
 +         module.function_bb_addr_maps()) {
++      if (skip_aliased_functions && IsAliased(function)) continue;
 +      const std::string function_name =
 +          function.function_names().empty()
 +              ? std::string(absl::StrFormat("0x%lx", function.function_address()))
@@ -849,8 +1007,319 @@ index 0000000..a42fec4
 +  return blocks;
 +}
 +
++namespace {
++
++// Why a block is not a Save-and-Jump (DeduBB Case III) candidate. These mirror
++// the checks in llvm/lib/CodeGen/DeduBB.cpp that can be decided from machine
++// bytes, so the groups written here are groups the backend actually applies.
++// (The BbAddrMap `edges` come from the PGO analysis map and are empty without
++// one, so they cannot tell a `jcc` block from a single-successor block.)
++enum class SaveAndJumpReject {
++  kNone,
++  kBranch,        // Indirect branch, a second conditional branch, or a branch
++                  // before the end of the block.
++  kCall,          // The callee may clobber %r11 and %r10.
++  kLinkRegister,  // Reads or writes %r11 (or %r10, in a two-exit block).
++  kRipRelative,   // Equal PC-relative bytes at different addresses name
++                  // different targets.
++  kStackPointer,  // Changes %rsp; the master's CFI describes another frame.
++  kSystem,        // syscall, int, ud, hlt.
++  kNoSuccessor,   // An exit is not another block of the same function.
++  kJumpOnly,      // Nothing but branches: no body to share.
++  kDecodeError,
++  kNumReasons,
++};
++
++constexpr std::array<const char*,
++                     static_cast<int>(SaveAndJumpReject::kNumReasons)>
++    kSaveAndJumpRejectNames = {"eligible",     "branch",      "call",
++                               "r10/r11",      "rip-relative", "rsp",
++                               "system",       "no-successor", "jump-only",
++                               "decode-error"};
++
++struct SaveAndJumpScanStats {
++  int64_t scanned = 0;
++  std::array<int64_t, static_cast<int>(SaveAndJumpReject::kNumReasons)>
++      by_reason{};
++};
++
++struct SaveAndJumpShape {
++  SaveAndJumpReject reject = SaveAndJumpReject::kNone;
++  bool two_exit = false;   // Ends in a conditional branch.
++  int condition = -1;      // That branch's condition code.
++  uint32_t jump_size = 0;  // Bytes of the branches at the end of the block.
++};
++
++// Decodes a block and decides whether it can be folded with Save-and-Jump:
++// straight-line code followed by one of
++//   (no branch)       one exit: the fall-through
++//   jmp T             one exit: T
++//   j<cc> T           two exits: T, or the fall-through
++//   j<cc> T ; jmp F   two exits: T or F
++// where every exit is another block of the same function.
++class SaveAndJumpAnalyzer {
++ public:
++  explicit SaveAndJumpAnalyzer(MiniDisassembler& disassembler)
++      : disassembler_(disassembler),
++        mii_(disassembler.instr_info()),
++        mri_(disassembler.register_info()),
++        r10_(FindRegister("R10")),
++        r11_(FindRegister("R11")),
++        rip_(FindRegister("RIP")),
++        rsp_(FindRegister("RSP")) {}
++
++  bool IsValid() const {
++    return r10_.isValid() && r11_.isValid() && rip_.isValid() &&
++           rsp_.isValid();
++  }
++
++  // Classifies the block `bytes` at `address`. `block_at` maps the start
++  // address of every block of the function to its entry.
++  SaveAndJumpShape Analyze(
++      llvm::ArrayRef<uint8_t> bytes, uint64_t address, bool can_fall_through,
++      const std::unordered_map<uint64_t, const BbEntryPb*>& block_at) const {
++    SaveAndJumpShape shape;
++    std::optional<uint64_t> taken;   // Target of the conditional branch.
++    std::optional<uint64_t> jumped;  // Target of the final `jmp`.
++    bool touches_r10 = false;
++    for (uint64_t offset = 0; offset < bytes.size();) {
++      uint64_t size = 0;
++      absl::StatusOr<llvm::MCInst> inst = disassembler_.DisassembleOne(
++          bytes.drop_front(offset), address + offset, size);
++      if (!inst.ok() || size == 0 || offset + size > bytes.size())
++        return {SaveAndJumpReject::kDecodeError};
++      const llvm::MCInstrDesc& desc = mii_.get(inst->getOpcode());
++      const llvm::StringRef name = mii_.getName(inst->getOpcode());
++      if (desc.isCall()) return {SaveAndJumpReject::kCall};
++      if (desc.mayAffectControlFlow(*inst, mri_)) {
++        // The master replaces the branches with its returns, and every copy
++        // returns to its own targets.
++        uint64_t target = 0;
++        if (!disassembler_.instr_analysis().evaluateBranch(
++                *inst, address + offset, size, target))
++          return {SaveAndJumpReject::kBranch};
++        if (name.starts_with("JCC_") && !shape.two_exit && !jumped &&
++            inst->getNumOperands() == 2 && inst->getOperand(1).isImm()) {
++          shape.two_exit = true;
++          shape.condition = static_cast<int>(inst->getOperand(1).getImm());
++          taken = target;
++        } else if (desc.isUnconditionalBranch() &&
++                   offset + size == bytes.size()) {
++          jumped = target;
++        } else {
++          return {SaveAndJumpReject::kBranch};
++        }
++        shape.jump_size += static_cast<uint32_t>(size);
++      } else {
++        // Straight-line code must come before the branches.
++        if (shape.jump_size > 0) return {SaveAndJumpReject::kBranch};
++        if (desc.isTrap() || name.starts_with("SYSCALL") ||
++            name.starts_with("SYSENTER") || name.starts_with("INT") ||
++            name.starts_with("UD") || name == "HLT")
++          return {SaveAndJumpReject::kSystem};
++        if (Touches(*inst, desc, r11_)) return {SaveAndJumpReject::kLinkRegister};
++        if (OperandsOverlap(*inst, 0, inst->getNumOperands(), rip_))
++          return {SaveAndJumpReject::kRipRelative};
++        if (Defines(*inst, desc, rsp_)) return {SaveAndJumpReject::kStackPointer};
++        touches_r10 = touches_r10 || Touches(*inst, desc, r10_);
++      }
++      offset += size;
++    }
++    if (shape.jump_size == bytes.size()) return {SaveAndJumpReject::kJumpOnly};
++    // A two-exit fold passes its second exit in %r10.
++    if (shape.two_exit && touches_r10) return {SaveAndJumpReject::kLinkRegister};
++    std::optional<uint64_t> next = jumped;  // The unconditional exit.
++    if (!next.has_value()) {
++      if (!can_fall_through) return {SaveAndJumpReject::kNoSuccessor};
++      next = address + bytes.size();
++    }
++    // Every exit must be another, non-EH-pad block of the same function; a
++    // `jmp` out of the function is a tail call.
++    const auto is_block = [&](uint64_t exit) {
++      const auto it = block_at.find(exit);
++      return exit != address && it != block_at.end() &&
++             !it->second->is_eh_pad();
++    };
++    if (!is_block(*next) ||
++        (shape.two_exit && (!is_block(*taken) || *taken == *next)))
++      return {SaveAndJumpReject::kNoSuccessor};
++    return shape;
++  }
++
++ private:
++  llvm::MCRegister FindRegister(llvm::StringRef name) const {
++    for (unsigned reg = 1, e = mri_.getNumRegs(); reg < e; ++reg)
++      if (name == mri_.getName(reg)) return llvm::MCRegister(reg);
++    return llvm::MCRegister();
++  }
++
++  // True if a register operand in [begin, end) is or overlaps `reg`.
++  bool OperandsOverlap(const llvm::MCInst& inst, unsigned begin, unsigned end,
++                       llvm::MCRegister reg) const {
++    for (unsigned i = begin; i < end && i < inst.getNumOperands(); ++i) {
++      const llvm::MCOperand& op = inst.getOperand(i);
++      if (op.isReg() && op.getReg().isValid() &&
++          mri_.regsOverlap(op.getReg(), reg))
++        return true;
++    }
++    return false;
++  }
++
++  bool ImplicitOverlap(llvm::ArrayRef<llvm::MCPhysReg> regs,
++                       llvm::MCRegister reg) const {
++    for (llvm::MCPhysReg r : regs)
++      if (mri_.regsOverlap(r, reg)) return true;
++    return false;
++  }
++
++  // Reads or writes `reg`, explicitly or implicitly.
++  bool Touches(const llvm::MCInst& inst, const llvm::MCInstrDesc& desc,
++               llvm::MCRegister reg) const {
++    return OperandsOverlap(inst, 0, inst.getNumOperands(), reg) ||
++           ImplicitOverlap(desc.implicit_uses(), reg) ||
++           ImplicitOverlap(desc.implicit_defs(), reg);
++  }
++
++  // Writes `reg`, explicitly or implicitly.
++  bool Defines(const llvm::MCInst& inst, const llvm::MCInstrDesc& desc,
++               llvm::MCRegister reg) const {
++    return OperandsOverlap(inst, 0, desc.getNumDefs(), reg) ||
++           ImplicitOverlap(desc.implicit_defs(), reg);
++  }
++
++  MiniDisassembler& disassembler_;
++  const llvm::MCInstrInfo& mii_;
++  const llvm::MCRegisterInfo& mri_;
++  const llvm::MCRegister r10_;
++  const llvm::MCRegister r11_;
++  const llvm::MCRegister rip_;
++  const llvm::MCRegister rsp_;
++};
++
++// Size of a Save-and-Jump fold site, or 0 if the backend cannot apply
++// Save-and-Jump on the target. Only x86-64 has link register hooks (%r11,
++// %r10): `leaq Succ(%rip),%r11` (7) + `jmp DeduBB.master.sj.K` (5).
++int SaveAndJumpPatchSize(const BinaryContent& binary_content) {
++  return binary_content.object_file->getArch() == llvm::Triple::x86_64 ? 12
++                                                                         : 0;
++}
++
++// Two-exit Save-and-Jump on x86-64. A fold is `leaq T(%rip),%r11;
++// leaq F(%rip),%r10; jmp DeduBB.master.sj2.K` (7 + 7 + 5). The master grows by
++// the two `leaq` placed in front of it (14) plus `j<cc> 1f; jmp *%r10;
++// 1: jmp *%r11` (2 + 3 + 3), minus its own branches.
++constexpr int kSaveAndJump2PatchSize = 19;
++constexpr int kSaveAndJump2MasterOverhead = 22;
++
++// Save-and-Jump candidates, split by the number of exits.
++struct SaveAndJumpCandidates {
++  std::vector<SaveAndJumpBlock> single_exit;
++  std::vector<SaveAndJumpBlock> two_exit;
++};
++
++// Builds the Save-and-Jump candidates. Each candidate's `bytes` exclude its
++// branches: the master returns through %r11 (and %r10) to whatever blocks the
++// fold names, so only the body, and the branch condition, have to match.
++SaveAndJumpCandidates BuildSaveAndJumpBlocks(
++    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
++    bool cold_only, bool skip_aliased_functions, SaveAndJumpScanStats& stats) {
++  SaveAndJumpCandidates candidates;
++  absl::StatusOr<std::unique_ptr<MiniDisassembler>> disassembler =
++      MiniDisassembler::Create(binary_content.object_file.get());
++  if (!disassembler.ok()) {
++    LOG(WARNING) << "DeduBB save-and-jump skipped: "
++                 << disassembler.status().message();
++    return candidates;
++  }
++  const SaveAndJumpAnalyzer analyzer(**disassembler);
++  if (!analyzer.IsValid()) {
++    LOG(WARNING) << "DeduBB save-and-jump skipped: R10/R11/RIP/RSP not found";
++    return candidates;
++  }
++  for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps()) {
++    for (const FunctionBbAddrMapPb& function :
++         module.function_bb_addr_maps()) {
++      if (skip_aliased_functions && IsAliased(function)) continue;
++      const std::string function_name =
++          function.function_names().empty()
++              ? std::string(absl::StrFormat("0x%lx", function.function_address()))
++              : std::string(function.function_names(0));
++      std::unordered_map<uint64_t, const BbEntryPb*> block_at;
++      for (const BbRangePb& bb_range : function.bb_ranges()) {
++        for (const BbEntryPb& bb_entry : bb_range.bb_entries()) {
++          block_at.emplace(bb_range.base_address() + bb_entry.offset(),
++                           &bb_entry);
++        }
++      }
++      for (const BbRangePb& bb_range : function.bb_ranges()) {
++        for (const BbEntryPb& bb_entry : bb_range.bb_entries()) {
++          const uint64_t address = bb_range.base_address() + bb_entry.offset();
++          // Tail-call and return blocks are Case I. The entry block holds the
++          // prologue and cannot host an in-place master.
++          if (bb_entry.has_return() || bb_entry.has_tail_call()) continue;
++          if (address == function.function_address()) continue;
++          if (bb_entry.size() == 0) continue;
++          if (bb_entry.is_eh_pad()) continue;
++          if (cold_only && (bb_entry.post_link_frequency() > 0 || bb_entry.frequency() > 0)) continue;
++
++          ++stats.scanned;
++          SaveAndJumpShape shape;
++          std::vector<uint8_t> bytes;
++          if (bb_entry.has_indirect_branch()) {
++            shape.reject = SaveAndJumpReject::kBranch;
++          } else if (bb_entry.callsites_size() > 0) {
++            shape.reject = SaveAndJumpReject::kCall;
++          } else {
++            absl::StatusOr<std::vector<uint8_t>> block_bytes = GetBlockBytes(
++                *binary_content.object_file, address, bb_entry.size());
++            if (block_bytes.ok()) {
++              bytes = *std::move(block_bytes);
++              shape = analyzer.Analyze(bytes, address,
++                                       bb_entry.can_fall_through(), block_at);
++            } else {
++              LOG(WARNING) << "Skipping block " << function_name << "#"
++                           << bb_entry.id() << ": "
++                           << block_bytes.status().message();
++              shape.reject = SaveAndJumpReject::kDecodeError;
++            }
++          }
++          ++stats.by_reason[static_cast<int>(shape.reject)];
++          if (shape.reject != SaveAndJumpReject::kNone) continue;
++          bytes.resize(bytes.size() - shape.jump_size);
++
++          std::string mod_name = std::string(module.module_name());
++          if (mod_name.empty()) {
++            size_t uniq_pos = function_name.find(".__uniq.");
++            if (uniq_pos != std::string::npos) {
++              mod_name = function_name.substr(uniq_pos + 8);
++            }
++          }
++          (shape.two_exit ? candidates.two_exit : candidates.single_exit)
++              .push_back(SaveAndJumpBlock{mod_name, function_name,
++                                         bb_entry.id(), address,
++                                         std::max(static_cast<uint64_t>(bb_entry.post_link_frequency()), static_cast<uint64_t>(bb_entry.frequency())),
++                                         std::move(bytes), shape.jump_size,
++                                         shape.condition});
++        }
++      }
++    }
++  }
++  return candidates;
++}
++
++std::string FormatRejects(const SaveAndJumpScanStats& stats) {
++  std::string out;
++  for (int i = 1; i < static_cast<int>(SaveAndJumpReject::kNumReasons); ++i) {
++    absl::StrAppendFormat(&out, "%s%s=%d", out.empty() ? "" : ", ",
++                          kSaveAndJumpRejectNames[i], stats.by_reason[i]);
++  }
++  return out;
++}
++
++}  // namespace
++
 +absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts) {
-+  if (opts.tail_call_profile_out_name().empty()) return absl::OkStatus();
++  if (opts.dedubb_profile_out_name().empty()) return absl::OkStatus();
 +
 +  ASSIGN_OR_RETURN(std::unique_ptr<BinaryContent> binary_content,
 +                   GetBinaryContent(opts.binary_name()));
@@ -860,18 +1329,59 @@ index 0000000..a42fec4
 +  // per-block tail-call/return flags we need.
 +  const BbAddrMapPb bb_addr_map = GetBbAddrMap(opts.binary_name());
 +
-+  std::vector<TailCallBlock> blocks = BuildTailCallBlocks(
-+      bb_addr_map, *binary_content, opts.tail_call_dedup_cold_only());
++  if (opts.dedubb_skip_aliased_functions()) {
++    int64_t aliased = 0;
++    for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps())
++      for (const FunctionBbAddrMapPb& function : module.function_bb_addr_maps())
++        aliased += IsAliased(function);
++    LOG(INFO) << "DeduBB: skipping " << aliased
++              << " function(s) whose address carries more than one name "
++                 "(aliases or identical-code-folded functions)";
++  }
++
++  std::vector<TailCallBlock> blocks =
++      BuildTailCallBlocks(bb_addr_map, *binary_content, opts.dedubb_cold_only(),
++                          opts.dedubb_skip_aliased_functions());
++
++  SaveAndJumpScanStats sj_stats;
++  SaveAndJumpCandidates sj_blocks;
++  const int sj_patch_size = SaveAndJumpPatchSize(*binary_content);
++  if (sj_patch_size > 0) {
++    sj_blocks = BuildSaveAndJumpBlocks(bb_addr_map, *binary_content,
++                                       opts.dedubb_cold_only(),
++                                       opts.dedubb_skip_aliased_functions(),
++                                       sj_stats);
++  } else {
++    LOG(INFO) << "DeduBB save-and-jump: not supported for this target";
++  }
 +
 +  TailCallDedupOptions dedup_options;
 +  dedup_options.patch_size = TailCallPatchSize(*binary_content);
-+  dedup_options.intra_module_only = opts.tail_call_dedup_intra_module_only();
++  dedup_options.intra_module_only = opts.dedubb_intra_module_only();
 +  const TailCallDedupResult result =
 +      DeduplicateTailCallBlocks(blocks, dedup_options);
 +
-+  const std::string out_path(opts.tail_call_profile_out_name());
++  SaveAndJumpDedupOptions sj_options;
++  sj_options.patch_size = sj_patch_size;
++  sj_options.intra_module_only = opts.dedubb_intra_module_only();
++  sj_options.first_master_id = result.num_masters; // start after tail call master ids
++  const SaveAndJumpDedupResult sj_result =
++      DeduplicateSaveAndJumpBlocks(sj_blocks.single_exit, sj_options);
++
++  SaveAndJumpDedupOptions sj2_options;
++  sj2_options.patch_size = kSaveAndJump2PatchSize;
++  sj2_options.master_overhead = kSaveAndJump2MasterOverhead;
++  sj2_options.intra_module_only = opts.dedubb_intra_module_only();
++  sj2_options.first_master_id = sj_options.first_master_id + sj_result.num_masters;
++  sj2_options.two_exit = true;
++  const SaveAndJumpDedupResult sj2_result =
++      DeduplicateSaveAndJumpBlocks(sj_blocks.two_exit, sj2_options);
++
++  const std::string out_path(opts.dedubb_profile_out_name());
 +  std::ofstream out(out_path, std::ofstream::out | std::ofstream::trunc);
 +  out << FormatDirectives(result);
++  out << FormatSaveAndJumpDirectives(sj_result);
++  out << FormatSaveAndJumpDirectives(sj2_result);
 +  if (!out) {
 +    return absl::UnavailableError(
 +        absl::StrFormat("Failed to write DeduBB directives to '%s'", out_path));
@@ -880,17 +1390,29 @@ index 0000000..a42fec4
 +  LOG(INFO) << "DeduBB tail-call dedup: " << blocks.size()
 +            << " candidate blocks, " << result.num_groups << " master group(s), "
 +            << result.num_folds << " fold(s), ~" << result.bytes_saved
-+            << " bytes saved; wrote " << opts.tail_call_profile_out_name();
++            << " bytes saved; wrote " << opts.dedubb_profile_out_name();
++  LOG(INFO) << "DeduBB save-and-jump: " << sj_stats.scanned
++            << " blocks scanned; rejected: " << FormatRejects(sj_stats);
++  LOG(INFO) << "DeduBB save-and-jump, one exit: "
++            << sj_blocks.single_exit.size() << " eligible, "
++            << sj_result.num_groups << " master group(s), "
++            << sj_result.num_folds << " fold(s), ~" << sj_result.bytes_saved
++            << " bytes saved";
++  LOG(INFO) << "DeduBB save-and-jump, two exits: "
++            << sj_blocks.two_exit.size() << " eligible, "
++            << sj2_result.num_groups << " master group(s), "
++            << sj2_result.num_folds << " fold(s), ~" << sj2_result.bytes_saved
++            << " bytes saved";
 +  return absl::OkStatus();
 +}
 +
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer.h b/propeller/tail_call_profile_writer.h
 new file mode 100644
-index 0000000..46fb10f
+index 0000000..1233b6b
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,66 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -908,16 +1430,17 @@ index 0000000..46fb10f
 +#ifndef PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
 +#define PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
 +
-+// Binary-facing glue for DeduBB tail-call deduplication ("Step 1").
++// Binary-facing glue for DeduBB basic-block deduplication ("Step 1").
 +//
 +// `WriteTailCallDedupProfile` reads the basic blocks of `opts.binary_name()`
 +// from its `SHT_LLVM_BB_ADDR_MAP` section, extracts the raw machine bytes of
-+// each block that ends in a tail call or return, runs the FNV-1a + byte-by-byte
-+// deduplication (see `tail_call_dedupper.h`), and writes the resulting
-+// `m`/`f`/`bbm`/`bbf` directives to `opts.tail_call_profile_out_name()`.
++// the candidate blocks, runs the FNV-1a + byte-by-byte deduplication (see
++// `tail_call_dedupper.h` and `save_and_jump_dedupper.h`), and writes the
++// resulting `m`/`f`/`bbm`/`bbf`/`bbmsj`/`bbfsj`/`bbmsj2`/`bbfsj2` directives to
++// `opts.dedubb_profile_out_name()`.
 +//
 +// This is a static analysis of the binary: it does not require a perf profile.
-+// A profile is only consulted when `opts.tail_call_dedup_cold_only()` is set, to
++// A profile is only consulted when `opts.dedubb_cold_only()` is set, to
 +// restrict folding to cold blocks.
 +
 +#include <vector>
@@ -936,17 +1459,562 @@ index 0000000..46fb10f
 +// non-zero post-link frequency are skipped.
 +std::vector<TailCallBlock> BuildTailCallBlocks(
 +    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
-+    bool cold_only);
++    bool cold_only, bool skip_aliased_functions);
++
++// Returns true if more than one symbol name points at `function`: an alias, or
++// functions merged by identical code folding. DeduBB leaves such functions
++// alone by default (`dedubb_skip_aliased_functions`): changing one of the
++// merged copies would stop the linker from merging them again.
++bool IsAliased(const FunctionBbAddrMapPb& function);
 +
 +// Returns the size in bytes of the jump used to patch a folded block on the
 +// binary's architecture (x86: 5, AArch64/ARM: 4).
 +int TailCallPatchSize(const BinaryContent& binary_content);
 +
-+// Runs DeduBB tail-call deduplication on `opts.binary_name()` and writes the
-+// directive file to `opts.tail_call_profile_out_name()`. A no-op (returns OK) if
-+// `tail_call_profile_out_name` is empty.
++// Runs DeduBB deduplication on `opts.binary_name()` and writes the directive
++// file to `opts.dedubb_profile_out_name()`. A no-op (returns OK) if
++// `dedubb_profile_out_name` is empty.
 +absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts);
 +
 +}  // namespace propeller
 +
 +#endif  // PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
+diff --git a/propeller/save_and_jump_dedupper.h b/propeller/save_and_jump_dedupper.h
+new file mode 100644
+index 0000000..e826503
+--- /dev/null
++++ b/propeller/save_and_jump_dedupper.h
+@@ -0,0 +1,129 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef PROPELLER_SAVE_AND_JUMP_DEDUPPER_H_
++#define PROPELLER_SAVE_AND_JUMP_DEDUPPER_H_
++
++#include "propeller/tail_call_dedupper.h"
++
++// DeduBB Save-and-Jump (Case III) deduplication core (LCTES'26).
++//
++// Folds byte-identical straight-line blocks that have exactly one successor.
++// On x86-64 every folded copy becomes
++//
++//   leaq Succ(%rip), %r11 ; jmp DeduBB.master.sj.K
++//
++// and the master ends in `jmp *%r11`, so each copy continues at its *own*
++// successor. That is why only the block body has to match: the trailing direct
++// `jmp` of a block (if any) is stripped before hashing and comparing, and its
++// size is kept separately because folding removes it too.
++//
++// Two-exit blocks end in a conditional branch. Their folds load both successors
++//
++//   leaq Taken(%rip), %r11 ; leaq NotTaken(%rip), %r10 ; jmp DeduBB.master.sj2.K
++//
++// and the master ends in `j<cc> 1f; jmp *%r10; 1: jmp *%r11`. The branches are
++// stripped as well; copies match when their bodies and branch conditions do.
++//
++// Deciding which blocks qualify (one successor, no calls, no %r11 use, no
++// PC-relative operands, no %rsp change) needs a disassembler and lives in
++// `tail_call_profile_writer.cc`. This header only groups and costs them, and
++// depends only on the C++ standard library so it can be unit-tested alone.
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace propeller {
++
++// 64-bit FNV-1a hash (Fowler-Noll-Vo, Noll). Used as the fast bucket key before
++// the byte-by-byte verification.
++uint64_t Fnv1aHash(const uint8_t* data, size_t size);
++uint64_t Fnv1aHash(const std::vector<uint8_t>& bytes);
++
++// A basic block that is a candidate for save-and-jump deduplication.
++struct SaveAndJumpBlock {
++  std::string module_name;     // Source module ("" if unknown).
++  std::string function_name;   // Function symbol the block belongs to.
++  uint32_t bb_id = 0;          // BB id within the function (matches BBAddrMap).
++  uint64_t address = 0;        // Binary address (used for deterministic order).
++  uint64_t frequency = 0;      // Execution frequency (used for master selection).
++  std::vector<uint8_t> bytes;  // Machine bytes of the block body, i.e. without
++                               // its trailing branches.
++  uint32_t jump_size = 0;      // Size of the stripped branches: the trailing
++                               // `jmp` (0 if the block falls through), plus the
++                               // conditional branch of a two-exit block.
++  int condition = -1;          // Condition code of a two-exit block's
++                               // conditional branch; -1 for a single exit.
++};
++
++struct SaveAndJumpDedupOptions {
++  // Bytes of a folded copy: x86-64 `leaq Succ(%rip),%r11` (7) + `jmp` (5).
++  int patch_size = 12;
++  // Bytes the master's own block grows by: the `leaq Succ(%rip),%r11` placed in
++  // front of it (7) plus its `jmp *%r11` (3). The master's own trailing `jmp`,
++  // if any, is replaced by the `jmp *%r11` and is credited back.
++  int master_overhead = 10;
++  // Minimum number of identical copies in a group before folding is considered.
++  int min_occurrences = 2;
++  // First value of K used for `DeduBB.master.sj.K` symbol names. Any unique
++  // numbering works; the CodeGen side only relies on master/fold lines of the
++  // same group sharing the same K.
++  uint64_t first_master_id = 0;
++  // If true, only deduplicate blocks that belong to the same module.
++  bool intra_module_only = false;
++  // If true, the blocks are two-exit blocks: emit `bbmsj2`/`bbfsj2`
++  // (DeduBB.master.sj2.K). Callers also set `patch_size` to 19 (two `leaq` + a
++  // `jmp`) and `master_overhead` to 22 (two `leaq` in front of the master, plus
++  // `j<cc> 1f; jmp *%r10; 1: jmp *%r11`).
++  bool two_exit = false;
++};
++
++struct SaveAndJumpDedupResult {
++  // Directives to emit, in deterministic order (by module, function, bb id).
++  std::vector<Directive> directives;
++  int num_groups = 0;       // Number of master groups (folded).
++  int num_masters = 0;      // Number of `bbmsj` directives (== num_groups).
++  int num_folds = 0;        // Number of `bbfsj` directives.
++  int64_t bytes_saved = 0;  // Estimated `.text` reduction in bytes.
++};
++
++// Runs the DeduBB Save-and-Jump dedup algorithm over `blocks`:
++//   1. bucket blocks by FNV-1a hash of their body bytes,
++//   2. within a bucket, group blocks with *identical* bodies (byte-by-byte)
++//      and branch conditions,
++//   3. keep the first block of each group (hottest, then lowest address) as the
++//      master and fold every other copy whose own saving
++//      `body + jump_size - patch_size` is positive; keep the group only if the
++//      folds save more than the master grows (`master_overhead - jump_size`).
++// The input is not mutated; ordering of the output is deterministic.
++SaveAndJumpDedupResult DeduplicateSaveAndJumpBlocks(
++    const std::vector<SaveAndJumpBlock>& blocks,
++    const SaveAndJumpDedupOptions& options = {});
++
++// Formats `result` as the textual directive file consumed by the LLVM CodeGen
++// side:
++//
++//   m <module>
++//   f <function>
++//   bbmsj <id> (DeduBB.master.sj.<K>)     bbmsj2 <id> (DeduBB.master.sj2.<K>)
++//   bbfsj <id> (DeduBB.master.sj.<K>)     bbfsj2 <id> (DeduBB.master.sj2.<K>)
++//
++// `m`/`f` headers are emitted whenever the module/function changes.
++std::string FormatSaveAndJumpDirectives(const SaveAndJumpDedupResult& result);
++
++}  // namespace propeller
++
++#endif  // PROPELLER_SAVE_AND_JUMP_DEDUPPER_H_
+diff --git a/propeller/save_and_jump_dedupper.cc b/propeller/save_and_jump_dedupper.cc
+new file mode 100644
+index 0000000..3925c54
+--- /dev/null
++++ b/propeller/save_and_jump_dedupper.cc
+@@ -0,0 +1,213 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "propeller/save_and_jump_dedupper.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <tuple>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace propeller {
++
++
++
++namespace {
++
++// A set of blocks (referenced by index into the caller's `blocks` vector) whose
++// body bytes are all identical. The first element (in `BlockOrderLess` order)
++// is the master copy.
++struct IdenticalGroup {
++  std::vector<int> members;  // indices into `blocks`, in `BlockOrderLess` order
++};
++
++// A group that is worth folding: its master and the copies that shrink.
++struct FoldPlan {
++  int master = 0;          // index into `blocks`
++  std::vector<int> folds;  // indices into `blocks`
++  int64_t benefit = 0;     // net `.text` bytes saved by the whole group
++};
++
++// Orders blocks deterministically; the hottest is promoted to the master.
++// We prioritize functions that do not have a ThinLTO ".llvm." suffix,
++// so that the master block is placed in a stable symbol name.
++bool BlockOrderLess(const SaveAndJumpBlock& a, const SaveAndJumpBlock& b) {
++  if (a.frequency != b.frequency) {
++    return a.frequency > b.frequency;
++  }
++  bool a_has_llvm = a.function_name.find(".llvm.") != std::string::npos;
++  bool b_has_llvm = b.function_name.find(".llvm.") != std::string::npos;
++  if (a_has_llvm != b_has_llvm) {
++    return !a_has_llvm;  // prefer a if it does NOT have .llvm.
++  }
++  return std::tie(a.address, a.module_name, a.function_name, a.bb_id) <
++         std::tie(b.address, b.module_name, b.function_name, b.bb_id);
++}
++
++// Orders directives for output: grouped by module, then function, then bb id.
++bool DirectiveOrderLess(const Directive& a, const Directive& b) {
++  return std::tie(a.module_name, a.function_name, a.bb_id) <
++         std::tie(b.module_name, b.function_name, b.bb_id);
++}
++
++}  // namespace
++
++SaveAndJumpDedupResult DeduplicateSaveAndJumpBlocks(
++    const std::vector<SaveAndJumpBlock>& blocks,
++    const SaveAndJumpDedupOptions& options) {
++  SaveAndJumpDedupResult result;
++
++  // Process blocks in a deterministic order so master selection (first in a
++  // group) and master-id assignment are reproducible.
++  std::vector<int> order(blocks.size());
++  for (int i = 0; i < static_cast<int>(blocks.size()); ++i) order[i] = i;
++  std::sort(order.begin(), order.end(), [&](int x, int y) {
++    return BlockOrderLess(blocks[x], blocks[y]);
++  });
++
++  // Bucket by FNV-1a hash of the body, then split each bucket into
++  // byte-identical groups. The hash is only a fast filter; group membership is
++  // decided by an exact byte-by-byte comparison, which rules out collisions.
++  std::unordered_map<uint64_t, std::vector<IdenticalGroup>> buckets;
++  for (int idx : order) {
++    const SaveAndJumpBlock& block = blocks[idx];
++    if (block.bytes.empty()) continue;
++    uint64_t hash = Fnv1aHash(block.bytes);
++    std::vector<IdenticalGroup>& bucket = buckets[hash];
++
++    IdenticalGroup* match = nullptr;
++    for (IdenticalGroup& group : bucket) {
++      // Verify against the group's representative (master) byte-for-byte; a
++      // two-exit block must also branch on the same condition.
++      const SaveAndJumpBlock& rep = blocks[group.members.front()];
++      if (rep.bytes == block.bytes && rep.condition == block.condition) {
++        if (!options.intra_module_only ||
++            rep.module_name == block.module_name) {
++          match = &group;
++          break;
++        }
++      }
++    }
++    if (match == nullptr) {
++      bucket.push_back(IdenticalGroup{{idx}});
++    } else {
++      match->members.push_back(idx);
++    }
++  }
++
++  // Cost each group. The master grows by `master_overhead` minus its own
++  // trailing `jmp` (which its `jmp *%r11` replaces); each folded copy shrinks
++  // from `body + jump_size` to `patch_size`. Copies that would grow are left
++  // alone, and a group is kept only if it saves bytes overall.
++  std::vector<FoldPlan> plans;
++  for (auto& [hash, bucket] : buckets) {
++    for (const IdenticalGroup& group : bucket) {
++      if (static_cast<int>(group.members.size()) < options.min_occurrences)
++        continue;
++      const SaveAndJumpBlock& master = blocks[group.members.front()];
++      const int64_t body = static_cast<int64_t>(master.bytes.size());
++      FoldPlan plan;
++      plan.master = group.members.front();
++      plan.benefit = -(options.master_overhead -
++                       static_cast<int64_t>(master.jump_size));
++      for (size_t i = 1; i < group.members.size(); ++i) {
++        const int64_t saving = body + blocks[group.members[i]].jump_size -
++                               options.patch_size;
++        if (saving <= 0) continue;
++        plan.folds.push_back(group.members[i]);
++        plan.benefit += saving;
++      }
++      if (static_cast<int>(plan.folds.size()) + 1 < options.min_occurrences ||
++          plan.benefit <= 0)
++        continue;
++      plans.push_back(std::move(plan));
++    }
++  }
++  // Sort by the master block so master ids are stable.
++  std::sort(plans.begin(), plans.end(),
++            [&](const FoldPlan& x, const FoldPlan& y) {
++              return BlockOrderLess(blocks[x.master], blocks[y.master]);
++            });
++
++  // Emit directives and tally stats.
++  const DirectiveKind master_kind = options.two_exit
++                                        ? DirectiveKind::kMasterSaveJump2
++                                        : DirectiveKind::kMasterSaveJump;
++  const DirectiveKind fold_kind = options.two_exit
++                                      ? DirectiveKind::kFoldSaveJump2
++                                      : DirectiveKind::kFoldSaveJump;
++  uint64_t master_id = options.first_master_id;
++  for (const FoldPlan& plan : plans) {
++    const SaveAndJumpBlock& master = blocks[plan.master];
++    result.directives.push_back(Directive{master_kind, master.module_name,
++                                          master.function_name, master.bb_id,
++                                          master_id});
++    for (int idx : plan.folds) {
++      const SaveAndJumpBlock& fold = blocks[idx];
++      result.directives.push_back(Directive{fold_kind, fold.module_name,
++                                            fold.function_name, fold.bb_id,
++                                            master_id});
++    }
++
++    ++result.num_groups;
++    ++result.num_masters;
++    result.num_folds += static_cast<int>(plan.folds.size());
++    result.bytes_saved += plan.benefit;
++    ++master_id;
++  }
++
++  std::sort(result.directives.begin(), result.directives.end(),
++            DirectiveOrderLess);
++  return result;
++}
++
++std::string FormatSaveAndJumpDirectives(const SaveAndJumpDedupResult& result) {
++  std::string out;
++  const std::string* cur_module = nullptr;
++  const std::string* cur_function = nullptr;
++  for (const Directive& d : result.directives) {
++    if (cur_module == nullptr || *cur_module != d.module_name) {
++      out += "m ";
++      out += d.module_name;
++      out += "\n";
++      cur_module = &d.module_name;
++      cur_function = nullptr;  // force re-emitting the function header
++    }
++    if (cur_function == nullptr || *cur_function != d.function_name) {
++      out += "f ";
++      out += d.function_name;
++      out += "\n";
++      cur_function = &d.function_name;
++    }
++    const bool two_exit = d.kind == DirectiveKind::kMasterSaveJump2 ||
++                          d.kind == DirectiveKind::kFoldSaveJump2;
++    if (d.kind == DirectiveKind::kMaster) out += "bbm ";
++    else if (d.kind == DirectiveKind::kFold) out += "bbf ";
++    else if (d.kind == DirectiveKind::kMasterSaveJump) out += "bbmsj ";
++    else if (d.kind == DirectiveKind::kFoldSaveJump) out += "bbfsj ";
++    else if (d.kind == DirectiveKind::kMasterSaveJump2) out += "bbmsj2 ";
++    else if (d.kind == DirectiveKind::kFoldSaveJump2) out += "bbfsj2 ";
++    out += std::to_string(d.bb_id);
++    out += two_exit ? " (DeduBB.master.sj2." : " (DeduBB.master.sj.";
++    out += std::to_string(d.master_id);
++    out += ")\n";
++  }
++  return out;
++}
++
++}  // namespace propeller
+diff --git a/propeller/save_and_jump_dedupper_test.cc b/propeller/save_and_jump_dedupper_test.cc
+new file mode 100644
+index 0000000..4bf368a
+--- /dev/null
++++ b/propeller/save_and_jump_dedupper_test.cc
+@@ -0,0 +1,179 @@
++// Copyright 2026 The Propeller Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "propeller/save_and_jump_dedupper.h"
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "gtest/gtest.h"
++#include "propeller/tail_call_dedupper.h"
++
++namespace propeller {
++namespace {
++
++// A block body of `size` bytes; different `seed`s give different bodies.
++std::vector<uint8_t> Body(int size, uint8_t seed = 0x40) {
++  std::vector<uint8_t> bytes(size);
++  for (int i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(seed + i);
++  return bytes;
++}
++
++SaveAndJumpBlock MakeBlock(std::string function, uint32_t id, uint64_t address,
++                           std::vector<uint8_t> body, uint32_t jump_size) {
++  return SaveAndJumpBlock{/*module_name=*/"", std::move(function), id, address,
++                          /*frequency=*/0, std::move(body), jump_size};
++}
++
++// Two 20-byte bodies that fall through: the fold saves 20 - 12 = 8 bytes, but
++// the master grows by 10 (leaq + jmp *%r11), so folding would lose 2 bytes.
++TEST(DeduplicateSaveAndJumpBlocksTest, ChargesMasterOverhead) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 1, 0x1000, Body(20), 0),
++      MakeBlock("b", 1, 0x2000, Body(20), 0),
++  };
++  const SaveAndJumpDedupResult result = DeduplicateSaveAndJumpBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 0);
++  EXPECT_TRUE(result.directives.empty());
++}
++
++// A third copy makes it pay: 2 * (20 - 12) - 10 = 6 bytes.
++TEST(DeduplicateSaveAndJumpBlocksTest, FoldsWhenCopiesOutweighMaster) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 1, 0x1000, Body(20), 0),
++      MakeBlock("b", 1, 0x2000, Body(20), 0),
++      MakeBlock("c", 1, 0x3000, Body(20), 0),
++  };
++  const SaveAndJumpDedupResult result = DeduplicateSaveAndJumpBlocks(blocks);
++  EXPECT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.num_folds, 2);
++  EXPECT_EQ(result.bytes_saved, 6);
++}
++
++// Bodies match even though the copies jump to different successors (the
++// trailing `jmp` is not part of `bytes`), and the stripped jumps are credited.
++TEST(DeduplicateSaveAndJumpBlocksTest, IgnoresTrailingJumpWhenMatching) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 4, 0x1000, Body(16), /*jump_size=*/5),
++      MakeBlock("b", 7, 0x2000, Body(16), /*jump_size=*/2),
++  };
++  // Fold: 16 + 2 - 12 = 6. Master grows by 10 - 5 = 5. Net: 1.
++  const SaveAndJumpDedupResult result = DeduplicateSaveAndJumpBlocks(blocks);
++  ASSERT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.bytes_saved, 1);
++  ASSERT_EQ(result.directives.size(), 2u);
++  EXPECT_EQ(result.directives[0].kind, DirectiveKind::kMasterSaveJump);
++  EXPECT_EQ(result.directives[0].function_name, "a");
++  EXPECT_EQ(result.directives[1].kind, DirectiveKind::kFoldSaveJump);
++  EXPECT_EQ(result.directives[1].function_name, "b");
++  EXPECT_EQ(result.directives[0].master_id, result.directives[1].master_id);
++}
++
++// A copy that would grow is left alone while the rest of the group folds.
++TEST(DeduplicateSaveAndJumpBlocksTest, SkipsCopiesThatWouldGrow) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 1, 0x1000, Body(11), 5),  // master: grows by 10 - 5 = 5
++      MakeBlock("b", 1, 0x2000, Body(11), 5),  // 11 + 5 - 12 = 4
++      MakeBlock("c", 1, 0x3000, Body(11), 0),  // 11 + 0 - 12 = -1: not folded
++      MakeBlock("d", 1, 0x4000, Body(11), 5),  // 4
++  };
++  const SaveAndJumpDedupResult result = DeduplicateSaveAndJumpBlocks(blocks);
++  ASSERT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.num_folds, 2);
++  EXPECT_EQ(result.bytes_saved, 3);
++  for (const Directive& d : result.directives) EXPECT_NE(d.function_name, "c");
++}
++
++TEST(DeduplicateSaveAndJumpBlocksTest, DoesNotFoldDifferentBodies) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 1, 0x1000, Body(40, 0x10), 0),
++      MakeBlock("b", 1, 0x2000, Body(40, 0x20), 0),
++      MakeBlock("c", 1, 0x3000, Body(40, 0x30), 0),
++  };
++  EXPECT_EQ(DeduplicateSaveAndJumpBlocks(blocks).num_groups, 0);
++}
++
++TEST(FormatSaveAndJumpDirectivesTest, EmitsSaveAndJumpDirectives) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeBlock("a", 3, 0x1000, Body(30), 0),
++      MakeBlock("b", 5, 0x2000, Body(30), 0),
++  };
++  SaveAndJumpDedupOptions options;
++  options.first_master_id = 7;
++  EXPECT_EQ(
++      FormatSaveAndJumpDirectives(DeduplicateSaveAndJumpBlocks(blocks, options)),
++      "m \n"
++      "f a\n"
++      "bbmsj 3 (DeduBB.master.sj.7)\n"
++      "f b\n"
++      "bbfsj 5 (DeduBB.master.sj.7)\n");
++}
++
++SaveAndJumpBlock MakeTwoExitBlock(std::string function, uint32_t id,
++                                  uint64_t address, std::vector<uint8_t> body,
++                                  uint32_t jump_size, int condition) {
++  return SaveAndJumpBlock{/*module_name=*/"", std::move(function), id, address,
++                          /*frequency=*/0, std::move(body), jump_size,
++                          condition};
++}
++
++SaveAndJumpDedupOptions TwoExitOptions() {
++  SaveAndJumpDedupOptions options;
++  options.patch_size = 19;
++  options.master_overhead = 22;
++  options.two_exit = true;
++  return options;
++}
++
++// Two-exit copies match only when they also branch on the same condition.
++TEST(DeduplicateSaveAndJumpBlocksTest, TwoExitBlocksMatchOnCondition) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      // Master: grows by 22 - 2 = 20.
++      MakeTwoExitBlock("a", 1, 0x1000, Body(40), 2, /*condition=*/4),
++      // Fold: 40 + 2 - 19 = 23.
++      MakeTwoExitBlock("b", 1, 0x2000, Body(40), 2, /*condition=*/4),
++      // Same body, other condition: not a copy of the others.
++      MakeTwoExitBlock("c", 1, 0x3000, Body(40), 2, /*condition=*/5),
++  };
++  const SaveAndJumpDedupResult result =
++      DeduplicateSaveAndJumpBlocks(blocks, TwoExitOptions());
++  ASSERT_EQ(result.num_groups, 1);
++  EXPECT_EQ(result.num_folds, 1);
++  EXPECT_EQ(result.bytes_saved, 3);
++  for (const Directive& d : result.directives) EXPECT_NE(d.function_name, "c");
++}
++
++TEST(FormatSaveAndJumpDirectivesTest, EmitsTwoExitDirectives) {
++  const std::vector<SaveAndJumpBlock> blocks = {
++      MakeTwoExitBlock("a", 3, 0x1000, Body(40), 6, 4),
++      MakeTwoExitBlock("b", 5, 0x2000, Body(40), 6, 4),
++  };
++  SaveAndJumpDedupOptions options = TwoExitOptions();
++  options.first_master_id = 9;
++  // Fold: 40 + 6 - 19 = 27. Master grows by 22 - 6 = 16. Net: 11.
++  const SaveAndJumpDedupResult result =
++      DeduplicateSaveAndJumpBlocks(blocks, options);
++  EXPECT_EQ(result.bytes_saved, 11);
++  EXPECT_EQ(FormatSaveAndJumpDirectives(result),
++            "m \n"
++            "f a\n"
++            "bbmsj2 3 (DeduBB.master.sj2.9)\n"
++            "f b\n"
++            "bbfsj2 5 (DeduBB.master.sj2.9)\n");
++}
++
++}  // namespace
++}  // namespace propeller
