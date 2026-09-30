@@ -1,9 +1,9 @@
 # DeduBB
 
 DeduBB removes duplicate machine code across a whole program. It finds basic
-blocks that are identical anywhere in a linked binary, across source files and
-ThinLTO modules, keeps one copy of each (the **master**), and turns every other
-copy into a jump or a call to it.
+blocks, and runs of instructions inside blocks, that are identical anywhere in a
+linked binary, across source files and ThinLTO modules, keeps one copy of each
+(the **master**), and turns every other copy into a jump or a call to it.
 
 It works in two steps:
 
@@ -25,6 +25,7 @@ a script that measures DeduBB on clang.
 | Save-and-Jump | falls through or ends in a `jmp`; no calls | a `jmp`, with its successor in `%r11` | `bbmsj` / `bbfsj` |
 | Two-exit Save-and-Jump | ends in a conditional branch; no calls | a `jmp`, with both successors in `%r11` and `%r10` | `bbmsj2` / `bbfsj2` |
 | Call-Return | the body before the block's branches, calls included | a `call` to a shared copy of the body | `bbmcr` / `bbfcr` |
+| Range | a run of instructions inside a block, calls included | a `call` to a shared copy of the run | `bbmcr` / `bbfcr` with `at=` |
 
 ```asm
 # Tail call: the master's own return or tail call finishes for the duplicate.
@@ -43,6 +44,11 @@ dup:    lea   taken(%rip), %r11          master:  <the shared block>
 # Call-Return: the duplicate calls the shared body, then runs its own branches.
 dup:    call  DeduBB.master.cr.K         master:  <the shared body>
         <its own branches>                        ret
+
+# Range: the same for a run; the code before and after it stays in place.
+dup:    <its own code>                   master:  <the shared run>
+        call  DeduBB.master.cr.K                  ret
+        <its own code>
 ```
 
 What makes a fold safe:
@@ -59,10 +65,19 @@ What makes a fold safe:
   with calls must not pass arguments on the stack. The masters live in one
   function per module, `DeduBB.cr.masters`, emitted from the bytes Step 1
   compared.
+* A range follows the same rules, and must also come after the function's
+  prologue and hold no frame setup or teardown, so that the frame is the same
+  all through it.
 * The compiler re-checks what it can see (a block's calls, its successors,
-  and for Call-Return its number of instructions) and leaves a block alone if
-  they do not match. It cannot see the rest of the code, so the directives must
-  come from a binary built from the same sources, compiler and flags.
+  and for Call-Return the number of instructions in the body, or in the block
+  for a range) and leaves a block alone if they do not match. It cannot see the
+  rest of the code, so the directives must come from a binary built from the
+  same sources, compiler and flags.
+* Directives name functions by their symbols. Step 1 leaves alone a function
+  whose name another function shares (such as local functions of the same
+  name in two files, which `-funique-internal-linkage-names` renames), and a
+  call in a Call-Return body to a function whose name another symbol has. It
+  writes no directives for a binary whose local symbols were discarded.
 
 ## Directive file
 
@@ -73,7 +88,7 @@ bbm <bb> (DeduBB.master.<K>) [callees=<c>]   # tail call: block <bb> is master K
 bbf <bb> (DeduBB.master.<K>) [callees=<c>]   # tail call: fold block <bb> into K
 bbmsj / bbfsj   <bb> (DeduBB.master.sj.<K>)  # Save-and-Jump
 bbmsj2 / bbfsj2 <bb> (DeduBB.master.sj2.<K>) # two-exit Save-and-Jump
-bbmcr / bbfcr   <bb> (DeduBB.master.cr.<K>) callees=<c> insts=<n> [body=<hex>]
+bbmcr / bbfcr   <bb> (DeduBB.master.cr.<K>) callees=<c> insts=<n> [at=<i> block_insts=<b>] [body=<hex>]
 ```
 
 `<bb>` is the block's ID in the basic-block address map, and all blocks of one
@@ -83,6 +98,10 @@ group share `<K>`.
   and separated by `,`. A target with several names (aliases) lists them
   separated by `|`, and `*` stands for an indirect call (Call-Return only).
 * `insts=` is the number of instructions in a Call-Return body.
+* `at=` and `block_insts=` make a Call-Return directive a range: the `insts=`
+  instructions from the block's instruction `at=` (counting from 0), in a block
+  of `block_insts=` instructions. `callees=` then lists the range's calls. A
+  block can hold several ranges, one line each.
 * `body=` is the Call-Return master's code in hex, split by `.` where each
   direct call goes. Only the master's line has it.
 
@@ -116,9 +135,27 @@ f _Z10cr_block_2mPm
 bbfcr 1 (DeduBB.master.cr.1) callees=_Z3mixmm insts=13
 ```
 
+and, with `--dedubb_subsequence` (ranges):
+
+```
+m seq_test1.cpp
+f _Z9seq_mix_1Pmm
+bbmcr 0 (DeduBB.master.cr.0) callees= insts=14 at=2 block_insts=18 body=4889f048c1e81f4831f048b9157c4a7fb979379e480fafc84889c848c1e81b4831c848b9eb113113bb49d094480fafc84889c848c1e81f4831c848894708
+m seq_test2.cpp
+f _Z9seq_mix_2Pmm
+bbfcr 0 (DeduBB.master.cr.0) callees= insts=14 at=2 block_insts=18
+f main
+bbmcr 0 (DeduBB.master.cr.1) callees=_Z9seq_mix_1Pmm,_Z9seq_mix_2Pmm insts=7 at=12 block_insts=92 body=4c89f74889de.4989c44c89f74889de.
+bbmcr 0 (DeduBB.master.cr.2) callees=_Z9seq_mix_1Pmm,_Z9seq_mix_2Pmm insts=7 at=31 block_insts=92 body=4c89f74c89e6.4989c54c89f74c89e6.
+bbfcr 0 (DeduBB.master.cr.2) callees=_Z9seq_mix_1Pmm,_Z9seq_mix_2Pmm insts=7 at=49 block_insts=92
+bbfcr 0 (DeduBB.master.cr.1) callees=_Z9seq_mix_1Pmm,_Z9seq_mix_2Pmm insts=7 at=67 block_insts=92
+```
+
 `tc_call_1` and `tc_call_2` tail-call the same function from different
 addresses, so their bytes differ in the `jmp`; the block matches because its
-target does.
+target does. `seq_mix_1` and `seq_mix_2` share 14 instructions between
+different first and last ones. In `main`, the unrolled loop repeats its pair of
+calls, with their argument moves, in two register assignments.
 
 ## Quickstart
 
@@ -177,6 +214,8 @@ Other options of step 2:
 | --- | --- |
 | `--dedubb_call_return` | also write Call-Return directives |
 | `--dedubb_call_return_estimate` | only log what Call-Return would save |
+| `--dedubb_subsequence` | write Call-Return directives for ranges, in place of whole bodies |
+| `--dedubb_subsequence_estimate` | only log what ranges would save |
 | `--dedubb_intra_module_only` | fold only within a module |
 | `--dedubb_skip_aliased_functions` | leave alone functions with several names, such as the ones `--icf` merged, so the linker can merge them again (default `true`) |
 | `--dedubb_cold_only` | fold only blocks that never ran, according to the profile |
@@ -186,7 +225,8 @@ Other options of step 2:
 `examples/test1.cpp` and `examples/test2.cpp` hold one pair of identical
 functions per tail-call and Save-and-Jump case, one function of each pair per
 file. `examples/cr_test1.cpp` and `examples/cr_test2.cpp` hold a block with a
-call in its middle, for Call-Return.
+call in its middle, for Call-Return, and `examples/seq_test1.cpp` and
+`examples/seq_test2.cpp` blocks that share only a run, for ranges.
 
 ```bash
 cd examples
@@ -202,6 +242,11 @@ $CXX cr_test1.cpp cr_test2.cpp -o cr_before
 generate_propeller_profiles --binary=cr_before --dedubb_profile=cr.txt --dedubb_call_return
 $CXX -Wl,-mllvm,-dedubb-directives=cr.txt cr_test1.cpp cr_test2.cpp -o cr_after
 diff <(./cr_before) <(./cr_after) && echo "same output"
+
+$CXX seq_test1.cpp seq_test2.cpp -o seq_before
+generate_propeller_profiles --binary=seq_before --dedubb_profile=seq.txt --dedubb_subsequence
+$CXX -Wl,-mllvm,-dedubb-directives=seq.txt seq_test1.cpp seq_test2.cpp -o seq_after
+diff <(./seq_before) <(./seq_after) && echo "same output"
 ```
 
 `-g` only gives Step 1 the module names of the `m` lines.
@@ -213,8 +258,25 @@ applies the patches, builds clang once with the basic-block address map and
 once with the DeduBB directives, and prints both sizes to
 `clang_dedubb_binaries/Results/sizes_clang_dedup.txt`. Both builds use `-Oz`,
 `-ffunction-sections -fdata-sections`, `--gc-sections` and `--icf=all`.
-`DEDUBB_SIZE_OPT=0` builds at `-O3` instead, and `DEDUBB_CALL_RETURN=0` leaves
-out Call-Return.
+`DEDUBB_SIZE_OPT=0` builds at `-O3` instead, `DEDUBB_SUBSEQUENCE=0` folds whole
+block bodies instead of ranges, and `DEDUBB_CALL_RETURN=0 DEDUBB_SUBSEQUENCE=0`
+leaves out Call-Return.
+
+It also builds clang twice with LLVM's MachineOutliner, which `-Oz` does not run
+on x86-64, with the baseline's flags plus:
+
+| Build | Compiler flags | Linker flags |
+| --- | --- | --- |
+| MachineOutliner | `-moutline` | `-moutline` |
+| MachineOutliner, two rounds | `-moutline` | `-moutline -Wl,-mllvm,-codegen-data-thinlto-two-rounds` |
+
+With ThinLTO, code generation runs in lld, so the linker flags are the ones that
+count: the clang driver passes `-moutline` to lld as
+`-plugin-opt=-enable-machine-outliner`. With `-codegen-data-thinlto-two-rounds`,
+lld generates code twice: the first round records the sequences it outlines,
+and the second outlines them in every module (global outlining).
+`DEDUBB_OUTLINER=0` skips both builds. The sizes file ends with a table of all
+builds side by side.
 
 ```bash
 ./reproduce_dedubb_clang.sh
