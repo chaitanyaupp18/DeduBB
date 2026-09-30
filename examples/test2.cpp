@@ -3,6 +3,8 @@
 extern int identical_block_1(int x);
 extern unsigned long sj_block_1(unsigned long a, unsigned long b,
                                 unsigned long n, unsigned long *out);
+extern unsigned long finish(unsigned long x);
+extern unsigned long tc_call_1(unsigned long x);
 
 __attribute__((noinline)) int identical_block_2(int x) {
     int y = x * 13;
@@ -31,6 +33,11 @@ __attribute__((noinline)) unsigned long sj_block_2(unsigned long a,
     return h ^ (h >> 17) ^ n ^ b;
 }
 
+// Same body as tc_call_1 in test1.cpp, tail call included.
+__attribute__((noinline)) unsigned long tc_call_2(unsigned long x) {
+    return finish(x * 0x9e3779b97f4a7c15UL + 12345);
+}
+
 int main(int argc, char** argv) {
     printf("%d %d\n", identical_block_1(argc), identical_block_2(argc));
     // Both paths of `if (h & 1)` are taken for these inputs; the two columns
@@ -42,5 +49,6 @@ int main(int argc, char** argv) {
         printf("%lu %lu | %lu %lu\n", r1, r2, out1[1] ^ out1[3],
                out2[1] ^ out2[3]);
     }
+    printf("%lu %lu\n", tc_call_1(argc), tc_call_2(argc));
     return 0;
 }

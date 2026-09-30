@@ -34,3 +34,15 @@ __attribute__((noinline)) unsigned long sj_block_1(unsigned long a,
     }
     return h ^ (h >> 17) ^ n ^ b;
 }
+
+// Tail-call fold of a block with a call: tc_call_2 (test2.cpp) ends in the
+// same tail call to `finish`. It jumps from another address, so its `jmp`
+// holds another displacement and the bytes differ; Step 1 compares the
+// target instead, and lists it in the directive (`callees=`).
+__attribute__((noinline)) unsigned long finish(unsigned long x) {
+    return (x ^ (x >> 29)) * 0xbf58476d1ce4e5b9UL;
+}
+
+__attribute__((noinline)) unsigned long tc_call_1(unsigned long x) {
+    return finish(x * 0x9e3779b97f4a7c15UL + 12345);
+}

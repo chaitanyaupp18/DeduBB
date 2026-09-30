@@ -20,10 +20,10 @@ index 002aaef..7216b02 100644
    clangBasic
 diff --git a/llvm/include/llvm/CodeGen/DeduBBDirectives.h b/llvm/include/llvm/CodeGen/DeduBBDirectives.h
 new file mode 100644
-index 000000000000..3dbe89ee1fad
+index 000000000000..abc008a98da4
 --- /dev/null
 +++ b/llvm/include/llvm/CodeGen/DeduBBDirectives.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,143 @@
 +//===- llvm/CodeGen/DeduBBDirectives.h - DeduBB directive reader -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -40,8 +40,8 @@ index 000000000000..3dbe89ee1fad
 +//
 +//     m <module>
 +//     f <function>
-+//     bbm <bb_id> (DeduBB.master.<K>)   ; this block is the master copy K
-+//     bbf <bb_id> (DeduBB.master.<K>)   ; fold this block into master K
++//     bbm <bb_id> (DeduBB.master.<K>) [callees=<c>] ; master copy K
++//     bbf <bb_id> (DeduBB.master.<K>) [callees=<c>] ; fold into master K
 +//     bbmsj <bb_id> (DeduBB.master.sj.<K>)  ; Save-and-Jump master copy K
 +//     bbfsj <bb_id> (DeduBB.master.sj.<K>)  ; Save-and-Jump fold into K
 +//     bbmsj2 <bb_id> (DeduBB.master.sj2.<K>) ; two-exit Save-and-Jump master
@@ -51,9 +51,12 @@ index 000000000000..3dbe89ee1fad
 +//
 +// `bbm` marks a basic block as the master copy: the compiler emits a global
 +// symbol `DeduBB.master.<K>` at the start of the block so that duplicates in
-+// this and other modules can branch to it. `bbf` marks a byte-identical
-+// duplicate that ends in a tail call or return: the compiler replaces the whole
-+// block with a single jump to `DeduBB.master.<K>`.
++// this and other modules can branch to it. `bbf` marks a duplicate that ends
++// in a tail call or return: the compiler replaces the whole block with a single
++// jump to `DeduBB.master.<K>`. The copies are byte-identical, except that a
++// direct call or jump reaches the same target from each: <c> names those
++// targets like a Call-Return `callees=` below, and a block whose calls and
++// jumps do not match it (or that has any without it) is not folded.
 +//
 +// `bbmsj`/`bbfsj` do the same for single-successor blocks that fall through.
 +// The fold passes its successor's address to the master in the target's link
@@ -79,6 +82,7 @@ index 000000000000..3dbe89ee1fad
 +#ifndef LLVM_CODEGEN_DEDUBBDIRECTIVES_H
 +#define LLVM_CODEGEN_DEDUBBDIRECTIVES_H
 +
++#include "llvm/ADT/ArrayRef.h"
 +#include "llvm/ADT/DenseMap.h"
 +#include "llvm/ADT/StringMap.h"
 +#include "llvm/ADT/StringRef.h"
@@ -89,6 +93,7 @@ index 000000000000..3dbe89ee1fad
 +namespace llvm {
 +
 +class Function;
++class MachineOperand;
 +
 +class DeduBBDirectives {
 +public:
@@ -106,8 +111,8 @@ index 000000000000..3dbe89ee1fad
 +  struct Directive {
 +    Kind K;
 +    uint64_t MasterID; // K in `DeduBB.master.K`.
-+    // Call-Return only: the `callees=` list, the `insts=` count and, for a
-+    // master, the `body=` hex.
++    // The `callees=` list (tail-call and Call-Return directives), and, for
++    // Call-Return only, the `insts=` count and, for a master, the `body=` hex.
 +    std::string Callees;
 +    unsigned NumInsts = 0;
 +    std::string Body;
@@ -133,6 +138,15 @@ index 000000000000..3dbe89ee1fad
 +
 +  // Returns true if the function has any Save-and-Jump directives.
 +  LLVM_ABI bool hasSaveJump(StringRef FuncName) const;
++
++  // Returns true if \p Listed, a directive's `callees=`, names the calls
++  // \p Actual in order. Each call may match any of its '|'-separated names.
++  LLVM_ABI static bool calleesMatch(StringRef Listed,
++                                    ArrayRef<std::string> Actual);
++
++  // Returns the name the target of a direct call, \p MO, has in the object
++  // file.
++  LLVM_ABI static std::string getCalleeName(const MachineOperand &MO);
 +
 +  // Returns true if there are any Call-Return directives.
 +  bool hasCallReturn() const { return HasCallReturn; }
@@ -407,10 +421,10 @@ index e0ed5731144b..0cf59803da76 100644
    initializeBreakFalseDepsLegacyPass(Registry);
 diff --git a/llvm/lib/CodeGen/DeduBB.cpp b/llvm/lib/CodeGen/DeduBB.cpp
 new file mode 100644
-index 000000000000..24b4fe0eb57a
+index 000000000000..1a61f239c81e
 --- /dev/null
 +++ b/llvm/lib/CodeGen/DeduBB.cpp
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,875 @@
 +//===- DeduBB.cpp - DeduBB tail-call basic block deduplication ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -430,6 +444,10 @@ index 000000000000..24b4fe0eb57a
 +//   bbf <id> (DeduBB.master.K)  -- block <id> is a duplicate. This pass deletes
 +//                                  the block body and replaces it with a single
 +//                                  jump to `DeduBB.master.K`.
++//
++// Either may end in `callees=<c>`, the targets of the block's direct calls and
++// jumps. A copy of the block reaches them from another address, so its bytes
++// differ there; a duplicate is folded only if its calls name exactly these.
 +//
 +// Folding is realized as a tail branch (the same instruction the
 +// MachineOutliner uses for tail-called outlined functions) so that the current
@@ -486,6 +504,7 @@ index 000000000000..24b4fe0eb57a
 +#include "llvm/IR/Module.h"
 +#include "llvm/InitializePasses.h"
 +#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCSymbol.h"
 +#include "llvm/Support/CommandLine.h"
 +#include "llvm/Support/MemoryBuffer.h"
 +#include "llvm/Support/UniqueBBID.h"
@@ -500,6 +519,13 @@ index 000000000000..24b4fe0eb57a
 +// Always enabled, so `-mllvm -stats` reports how many directives were applied,
 +// and why the rest were not, in release builds too.
 +ALWAYS_ENABLED_STATISTIC(NumTailCallFolds, "Number of tail-call blocks folded");
++ALWAYS_ENABLED_STATISTIC(
++    NumTailCallSkipSymbols,
++    "Number of tail-call folds skipped: the block names a symbol other than "
++    "the calls and jumps its directive lists");
++ALWAYS_ENABLED_STATISTIC(
++    NumTailCallSkipSuccessors,
++    "Number of tail-call folds skipped: the block has a successor");
 +ALWAYS_ENABLED_STATISTIC(NumSJFolds, "Number of Save-and-Jump blocks folded");
 +ALWAYS_ENABLED_STATISTIC(NumSJMastersInPlace,
 +                         "Number of Save-and-Jump masters rewritten in place");
@@ -656,6 +682,9 @@ index 000000000000..24b4fe0eb57a
 +      else DK = DeduBBDirectives::FoldCallReturn;
 +
 +      Directive D{DK, K};
++      if (DK == DeduBBDirectives::Master || DK == DeduBBDirectives::Fold)
++        if (std::optional<StringRef> Callees = getField(Tail, "callees"))
++          D.Callees = Callees->str();
 +      if (DK == DeduBBDirectives::MasterCallReturn ||
 +          DK == DeduBBDirectives::FoldCallReturn) {
 +        if (!parseCallReturn(Tail, DK == DeduBBDirectives::MasterCallReturn,
@@ -736,6 +765,33 @@ index 000000000000..24b4fe0eb57a
 +      return true;
 +  }
 +  return false;
++}
++
++bool DeduBBDirectives::calleesMatch(StringRef Listed,
++                                    ArrayRef<std::string> Actual) {
++  SmallVector<StringRef, 4> Calls;
++  if (!Listed.empty())
++    Listed.split(Calls, ',');
++  if (Calls.size() != Actual.size())
++    return false;
++  for (auto [Names, Name] : zip_equal(Calls, Actual)) {
++    SmallVector<StringRef, 4> Alternatives;
++    Names.split(Alternatives, '|');
++    if (!is_contained(Alternatives, StringRef(Name)))
++      return false;
++  }
++  return true;
++}
++
++std::string DeduBBDirectives::getCalleeName(const MachineOperand &MO) {
++  if (MO.isGlobal()) {
++    StringRef Name = MO.getGlobal()->getName();
++    Name.consume_front("\1");
++    return Name.str();
++  }
++  if (MO.isSymbol())
++    return MO.getSymbolName();
++  return MO.getMCSymbol()->getName().str();
 +}
 +
 +const DeduBBDirectives &DeduBBDirectives::get() {
@@ -1194,23 +1250,40 @@ index 000000000000..24b4fe0eb57a
 +
 +  bool Changed = false;
 +  for (auto [MBB, D] : TailCallFolds) {
-+    // The profiler may have marked blocks as identical even if their
-+    // relocation targets differ. Refuse to fold any block containing
-+    // relocation-like operands to prevent bad merges.
-+    bool HasRelocation = false;
++    // The fold's jump replaces every way out of the block, so it must have
++    // none but its return or tail call: no fall-through (a conditional tail
++    // call) and no landing pad.
++    if (!MBB->succ_empty()) {
++      ++NumTailCallSkipSuccessors;
++      continue;
++    }
++    // Step 1 groups blocks that run the same instructions to the same
++    // addresses, so the master, which runs its own calls and jumps, reaches
++    // what this block did. Only symbols that are the targets of direct calls
++    // and jumps, and that the directive names in order, can be checked
++    // against that; a block naming anything else (data, a constant pool, a
++    // jump table, a label) or anything unlisted is left as is.
++    SmallVector<std::string, 4> Callees;
++    bool Unlisted = false;
 +    for (const MachineInstr &MI : *MBB) {
++      if (MI.isDebugInstr())
++        continue;
 +      for (const MachineOperand &MO : MI.operands()) {
-+        if (MO.isGlobal() || MO.isSymbol() || MO.isCPI() || MO.isJTI() ||
-+            MO.isBlockAddress() || MO.isMCSymbol()) {
-+          HasRelocation = true;
-+          break;
++        if (MO.isCPI() || MO.isJTI() || MO.isBlockAddress() ||
++            MO.isTargetIndex()) {
++          Unlisted = true;
++        } else if (MO.isGlobal() || MO.isSymbol() || MO.isMCSymbol()) {
++          if (!MI.isCall() || MO.getOffset() != 0)
++            Unlisted = true;
++          else
++            Callees.push_back(DeduBBDirectives::getCalleeName(MO));
 +        }
 +      }
-+      if (HasRelocation)
-+        break;
 +    }
-+    if (HasRelocation)
++    if (Unlisted || !DeduBBDirectives::calleesMatch(D->Callees, Callees)) {
++      ++NumTailCallSkipSymbols;
 +      continue;
++    }
 +
 +    // Replace the entire block with a single tail branch to the master copy.
 +    std::string MasterSym = ("DeduBB.master." + Twine(D->MasterID)).str();
@@ -1672,10 +1745,10 @@ index 000000000000..c20a3ce6879e
 +; CHECK-NOT: retq
 diff --git a/llvm/lib/CodeGen/DeduBBCallReturn.cpp b/llvm/lib/CodeGen/DeduBBCallReturn.cpp
 new file mode 100644
-index 000000000000..e8606612c7d7
+index 000000000000..9b7411772100
 --- /dev/null
 +++ b/llvm/lib/CodeGen/DeduBBCallReturn.cpp
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,705 @@
 +//===- DeduBBCallReturn.cpp - DeduBB Call-Return folds --------------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -1839,18 +1912,6 @@ index 000000000000..e8606612c7d7
 +};
 +} // namespace
 +
-+// Returns the name \p MO, the callee of a direct call, has in the object file.
-+static std::string getCalleeName(const MachineOperand &MO) {
-+  if (MO.isGlobal()) {
-+    StringRef Name = MO.getGlobal()->getName();
-+    Name.consume_front("\1");
-+    return Name.str();
-+  }
-+  if (MO.isSymbol())
-+    return MO.getSymbolName();
-+  return MO.getMCSymbol()->getName().str();
-+}
-+
 +// A call to a function that returns twice would save the master's frame,
 +// which is gone once the master returns. The names are the ones Step 1 refuses.
 +static bool returnsTwice(const MachineOperand &Callee, StringRef Name) {
@@ -1864,23 +1925,6 @@ index 000000000000..e8606612c7d7
 +      "savectx", "vfork",   "__vfork",  "getcontext", "__getcontext",
 +      "qsetjmp"};
 +  return is_contained(Names, Name);
-+}
-+
-+// Returns true if \p Listed, a directive's `callees=`, names the calls
-+// \p Actual in order. Each call may match any of its '|'-separated names.
-+static bool calleesMatch(StringRef Listed, ArrayRef<std::string> Actual) {
-+  SmallVector<StringRef, 4> Calls;
-+  if (!Listed.empty())
-+    Listed.split(Calls, ',');
-+  if (Calls.size() != Actual.size())
-+    return false;
-+  for (auto [Names, Name] : zip_equal(Calls, Actual)) {
-+    SmallVector<StringRef, 4> Alternatives;
-+    Names.split(Alternatives, '|');
-+    if (!is_contained(Alternatives, StringRef(Name)))
-+      return false;
-+  }
-+  return true;
 +}
 +
 +// Decides whether \p MBB's instructions produce the bytes of directive \p D's
@@ -1964,7 +2008,8 @@ index 000000000000..e8606612c7d7
 +    if (!TII.isDeduBBCallReturnMovable(MI, Callee))
 +      return Fail(BodyInfo::Ineligible);
 +    if (MI.isCall()) {
-+      std::string Name = Callee ? getCalleeName(*Callee) : "*";
++      std::string Name =
++          Callee ? DeduBBDirectives::getCalleeName(*Callee) : "*";
 +      if (Callee && returnsTwice(*Callee, Name))
 +        return Fail(BodyInfo::Ineligible);
 +      Info.Callees.push_back(std::move(Name));
@@ -2009,7 +2054,7 @@ index 000000000000..e8606612c7d7
 +  }
 +  if (Info.NumInsts != D.NumInsts)
 +    return Fail(BodyInfo::Mismatch);
-+  if (!calleesMatch(D.Callees, Info.Callees))
++  if (!DeduBBDirectives::calleesMatch(D.Callees, Info.Callees))
 +    return Fail(BodyInfo::CalleeMismatch);
 +  return Info;
 +}
@@ -2982,4 +3027,94 @@ index 000000000000..7fd0825c9f99
 +  %j3 = getelementptr i32, ptr %p, i64 4
 +  store volatile i32 %a, ptr %j3
 +  ret void
++}
+diff --git a/llvm/test/CodeGen/X86/dedubb-tail-call-callees.ll b/llvm/test/CodeGen/X86/dedubb-tail-call-callees.ll
+new file mode 100644
+index 000000000000..9fc7d9c17295
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/dedubb-tail-call-callees.ll
+@@ -0,0 +1,84 @@
++; Tests `callees=` on tail-call directives: a bbf block that calls or jumps to
++; a function is folded only if the directive names exactly its targets, and a
++; block with a successor or another symbol is never folded.
++
++; RUN: printf 'm test.c\nf m_call\nbbm 0 (DeduBB.master.1) callees=callee\nf f_call\nbbf 0 (DeduBB.master.1) callees=other|callee\nf f_wrong\nbbf 0 (DeduBB.master.1) callees=other\nf f_nolist\nbbf 0 (DeduBB.master.1)\nf m_data\nbbm 0 (DeduBB.master.2)\nf f_data\nbbf 0 (DeduBB.master.2) callees=\nf f_succ\nbbf 0 (DeduBB.master.2)\n' > %t.dir
++; RUN: llc -mtriple=x86_64-unknown-linux-gnu -basic-block-address-map \
++; RUN:     -dedubb-directives=%t.dir < %s | FileCheck %s
++
++declare i32 @callee(i32)
++
++@g = global i32 0
++
++; CHECK-LABEL: m_call:
++; CHECK:       DeduBB.master.1:
++; CHECK:       jmp callee
++define i32 @m_call(i32 %x) {
++  %a = add i32 %x, 7
++  %r = tail call i32 @callee(i32 %a)
++  ret i32 %r
++}
++
++; The directive names the tail call's target (as one of its names): folded.
++; CHECK-LABEL: f_call:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:  jmp DeduBB.master.1
++; CHECK-NOT:   callee
++; CHECK:       .Lfunc_end
++define i32 @f_call(i32 %x) {
++  %a = add i32 %x, 7
++  %r = tail call i32 @callee(i32 %a)
++  ret i32 %r
++}
++
++; The directive names another function: left as is.
++; CHECK-LABEL: f_wrong:
++; CHECK-NOT:   DeduBB.master
++; CHECK:       jmp callee
++define i32 @f_wrong(i32 %x) {
++  %a = add i32 %x, 7
++  %r = tail call i32 @callee(i32 %a)
++  ret i32 %r
++}
++
++; No `callees=` (a directive from an older Step 1): left as is.
++; CHECK-LABEL: f_nolist:
++; CHECK-NOT:   DeduBB.master
++; CHECK:       jmp callee
++define i32 @f_nolist(i32 %x) {
++  %a = add i32 %x, 7
++  %r = tail call i32 @callee(i32 %a)
++  ret i32 %r
++}
++
++; CHECK-LABEL: m_data:
++; CHECK:       DeduBB.master.2:
++define i32 @m_data(i32 %x) {
++  %v = load i32, ptr @g
++  %s = add i32 %v, %x
++  ret i32 %s
++}
++
++; A symbol that is not a call target cannot be checked: left as is.
++; CHECK-LABEL: f_data:
++; CHECK-NOT:   DeduBB.master
++; CHECK:       {{g(@GOTPCREL)?}}(%rip)
++define i32 @f_data(i32 %x) {
++  %v = load i32, ptr @g
++  %s = add i32 %v, %x
++  ret i32 %s
++}
++
++; A block with successors: its fold would lose them, so it is left as is.
++; CHECK-LABEL: f_succ:
++; CHECK-NOT:   DeduBB.master
++; CHECK:       .Lfunc_end
++define i32 @f_succ(i32 %x) {
++entry:
++  %c = icmp eq i32 %x, 0
++  br i1 %c, label %a, label %b
++a:
++  ret i32 1
++b:
++  ret i32 2
 +}
