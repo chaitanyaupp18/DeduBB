@@ -5,6 +5,9 @@ blocks, and runs of instructions inside blocks, that are identical anywhere in a
 linked binary, across source files and ThinLTO modules, keeps one copy of each
 (the **master**), and turns every other copy into a jump or a call to it.
 
+DeduBB is described in the LCTES 2026 paper [DeduBB: Binary Code Size Reduction
+via Post-Link Basic Block Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169).
+
 It works in two steps:
 
 1. **Find duplicates.** [Propeller](https://github.com/google/llvm-propeller)'s
@@ -280,4 +283,21 @@ builds side by side.
 
 ```bash
 ./reproduce_dedubb_clang.sh
+```
+
+## Citation
+
+```bibtex
+@inproceedings{dedubb2026,
+  title     = {DeduBB: Binary Code Size Reduction via Post-Link Basic Block Deduplication},
+  author    = {Mamatha Ananda, Chaitanya and Afarin, Mahbod and Gupta, Rajiv and
+               Tallam, Sriraman and Shen, Han and Li, Xinliang David},
+  booktitle = {Proceedings of the 27th ACM SIGPLAN/SIGBED International Conference on
+               Languages, Compilers, and Tools for Embedded Systems},
+  series    = {LCTES '26},
+  pages     = {43--56},
+  year      = {2026},
+  publisher = {ACM},
+  doi       = {10.1145/3814943.3816169}
+}
 ```
