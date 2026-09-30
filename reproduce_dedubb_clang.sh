@@ -4,16 +4,18 @@
 ##
 ## This script automatically clones LLVM and Propeller, applies the DeduBB patches,
 ## and compiles a pristine LLVM compiler to evaluate the deduplication savings
-## (tail-call folds, and one- and two-exit Save-and-Jump folds).
+## (tail-call folds, one- and two-exit Save-and-Jump folds, and Call-Return folds).
 ##
 ## Both clang builds (the BBAddrMap baseline and the DeduBB build) are optimized for
 ## size: -Oz, one section per function and datum, --gc-sections and --icf=all. The
 ## savings reported are on top of those. Run with DEDUBB_SIZE_OPT=0 to use the plain
-## Release (-O3) flags instead.
+## Release (-O3) flags instead, and with DEDUBB_CALL_RETURN=0 to leave out the
+## Call-Return folds.
 
 set -eux
 
 DEDUBB_SIZE_OPT=${DEDUBB_SIZE_OPT:-1}
+DEDUBB_CALL_RETURN=${DEDUBB_CALL_RETURN:-1}
 
 CWD="$(pwd)"
 BASE_DIR=${CWD}/clang_dedubb_binaries
@@ -109,7 +111,15 @@ ninja clang
 # With --icf=all, functions the linker merged share one address under several names.
 # Propeller leaves those alone (--dedubb_skip_aliased_functions, on by default), so
 # the DeduBB build does not stop the linker from merging them again.
-/usr/bin/time -v ${PATH_TO_GENERATE_PROFILES} --binary=${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} --dedubb_profile=${PATH_TO_PROFILES}/dedubb_directives.txt 2> ${PATH_TO_ALL_RESULTS}/mem_propeller_dedup_conversion.txt
+# --dedubb_call_return adds Call-Return folds: a block's body, calls included, moves
+# into one shared routine that every copy calls. Blocks that qualify for both get it
+# instead of Save-and-Jump, whose stubs are larger.
+DEDUBB_FLAGS=()
+if [[ "${DEDUBB_CALL_RETURN}" == 1 ]]; then
+  DEDUBB_FLAGS+=("--dedubb_call_return")
+fi
+/usr/bin/time -v ${PATH_TO_GENERATE_PROFILES} --binary=${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION} --dedubb_profile=${PATH_TO_PROFILES}/dedubb_directives.txt ${DEDUBB_FLAGS[@]+"${DEDUBB_FLAGS[@]}"} 2> ${PATH_TO_ALL_RESULTS}/mem_propeller_dedup_conversion.txt
+grep "DeduBB" ${PATH_TO_ALL_RESULTS}/mem_propeller_dedup_conversion.txt | sed 's/^.*\] //' > ${PATH_TO_ALL_RESULTS}/dedubb_step1.txt || true
 
 # 7. Build DeduBB Optimized Clang
 # Same flags as the baseline, plus the patch's CLANG_DEDUBB_DIRECTIVES option, which

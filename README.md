@@ -7,8 +7,9 @@ A minimal test case that shows Propeller and the `DeduBB` CodeGen pass finding i
 | Kind | Block shape | Directives |
 |---|---|---|
 | **Tail call** | ends in a return or tail call | `bbm` / `bbf` |
-| **Save-and-Jump** | ends in a unconditional branch | `bbmsj` / `bbfsj` |
-| **Two-exit Save-and-Jump** | ends in a conditional branch | `bbmsj2` / `bbfsj2` |
+| **Save-and-Jump** | ends in an unconditional branch or falls through, no calls | `bbmsj` / `bbfsj` |
+| **Two-exit Save-and-Jump** | ends in a conditional branch, no calls | `bbmsj2` / `bbfsj2` |
+| **Call-Return** | any body before the block's branches, calls included (`--dedubb_call_return`) | `bbmcr` / `bbfcr` |
 
 ```asm
 # Tail call: the master's own `ret` returns for the duplicate.
@@ -28,9 +29,19 @@ master:     ...                          # the shared block, same condition
             j<cc> 1f
             jmp   *%r10                  # branch not taken
 1:          jmp   *%r11                  # branch taken
+
+# Call-Return: the duplicate calls the shared body, then runs its own branches.
+duplicate:  call  DeduBB.master.cr.K     # a body without calls
+            <its own branches>
+duplicate:  push  %rax                   # a body with calls: keep the stack
+            call  DeduBB.master.cr.K     #   16-byte aligned for them
+            lea   8(%rsp), %rsp          # (push and lea leave the flags alone)
+            <its own branches>
+master:     ...                          # the shared body, in DeduBB.cr.masters
+            ret
 ```
 
-Folds never touch the stack: the master runs in the duplicate's frame and continues exactly where the duplicate would have.
+Tail-call and Save-and-Jump folds never touch the stack: the master runs in the duplicate's frame and continues exactly where the duplicate would have. A Call-Return fold only pushes onto the stack (the return address, plus 8 bytes of padding when the body makes calls), so its body must not use `%rsp` itself, and its function must not keep data below `%rsp` (the red zone) or, for a body with calls, pass arguments on the stack.
 
 ## 1. The Test Case (Before & After Assembly)
 
@@ -172,6 +183,91 @@ Following a call to `sj_block_2`:
 2. **bb 2 at `18c8` (Save-and-Jump).** It loads its successor `18d4` into `%r11` and jumps to `DeduBB.master.sj.2`, which does the stores and returns with `jmp *%r11`.
 3. **bb 3 at `18d4` (tail call).** It jumps to `DeduBB.master.1`, whose `ret` returns from `sj_block_2`.
 
+### 1c. Call-Return
+
+`examples/cr_test1.cpp` and `examples/cr_test2.cpp` hold `cr_block_1` / `cr_block_2`. Their bb 1 makes a call in its middle, so the folds above cannot share it: a tail call needs a block that ends the function, and Save-and-Jump a block without calls (a call clobbers `%r11` and `%r10`). This example is built with `--dedubb_call_return` (Step 2 below).
+
+**Before (Baseline):** `cr_block_1` is byte-identical to `cr_block_2`, shown here.
+
+```assembly
+00000000000018e0 <_Z10cr_block_2mPm>:
+    18e0:       41 56                   push   %r14                          # bb 0: h = step(a); if (h == 0)
+    18e2:       53                      push   %rbx
+    18e3:       50                      push   %rax
+    18e4:       49 89 f6                mov    %rsi,%r14
+    18e7:       48 89 fb                mov    %rdi,%rbx
+    18ea:       e8 a1 ff ff ff          call   1890 <_Z4stepm>
+    18ef:       48 85 c0                test   %rax,%rax
+    18f2:       74 3f                   je     1933 <_Z10cr_block_2mPm+0x53>
+    18f4:       48 b9 15 7c 4a 7f b9    movabs $0x9e3779b97f4a7c15,%rcx      # bb 1: the shared body,
+    18fb:       79 37 9e                                                     #   with a call in it
+    18fe:       48 0f af c1             imul   %rcx,%rax
+    1902:       49 89 06                mov    %rax,(%r14)
+    1905:       48 89 c7                mov    %rax,%rdi
+    1908:       48 89 de                mov    %rbx,%rsi
+    190b:       e8 b0 ff ff ff          call   18c0 <_Z3mixmm>
+    1910:       48 89 c1                mov    %rax,%rcx
+    1913:       48 c1 e9 1f             shr    $0x1f,%rcx
+    1917:       48 31 c1                xor    %rax,%rcx
+    191a:       49 89 4e 08             mov    %rcx,0x8(%r14)
+    191e:       48 8d 0c 18             lea    (%rax,%rbx,1),%rcx
+    1922:       49 89 4e 10             mov    %rcx,0x10(%r14)
+    1926:       a8 01                   test   $0x1,%al
+    1928:       74 04                   je     192e <_Z10cr_block_2mPm+0x4e> #   ... then if (h & 1)
+    192a:       49 89 46 18             mov    %rax,0x18(%r14)               # bb 2
+    192e:       48 31 d8                xor    %rbx,%rax                     # bb 3
+    1931:       eb 02                   jmp    1935 <_Z10cr_block_2mPm+0x55>
+    1933:       31 c0                   xor    %eax,%eax                     # bb 5
+    1935:       48 83 c4 08             add    $0x8,%rsp                     # bb 4: return
+    1939:       5b                      pop    %rbx
+    193a:       41 5e                   pop    %r14
+    193c:       c3                      ret
+```
+
+**After DeduBB:** bb 1 of both functions becomes a call to `DeduBB.master.cr.1`. The compiler emits that master, from the bytes Step 1 compared, in a function of its own, `DeduBB.cr.masters`, which has its own unwind info (`objdump` shows the function's name, since the first master sits at its start). The body makes a call itself, so the stub keeps the stack 16-byte aligned for it with `push %rax` and `lea 0x8(%rsp),%rsp`. Neither writes the flags, so the `je` after the stub still tests the body's `test $0x1,%al`. The return block, bb 4, is a tail-call fold as before.
+
+```assembly
+0000000000001910 <_Z10cr_block_2mPm>:
+    1910:       41 56                   push   %r14
+    1912:       53                      push   %rbx
+    1913:       50                      push   %rax
+    1914:       49 89 f6                mov    %rsi,%r14
+    1917:       48 89 fb                mov    %rdi,%rbx
+    191a:       e8 a1 ff ff ff          call   18c0 <_Z4stepm>
+    191f:       48 85 c0                test   %rax,%rax
+    1922:       74 16                   je     193a <_Z10cr_block_2mPm+0x2a>
+    1924:       50                      push   %rax                          # bb 1: the stub
+    1925:       e8 5a ff ff ff          call   1884 <DeduBB.cr.masters>
+    192a:       48 8d 64 24 08          lea    0x8(%rsp),%rsp
+    192f:       74 04                   je     1935 <_Z10cr_block_2mPm+0x25>
+    1931:       49 89 46 18             mov    %rax,0x18(%r14)
+    1935:       48 31 d8                xor    %rbx,%rax
+    1938:       eb 02                   jmp    193c <_Z10cr_block_2mPm+0x2c>
+    193a:       31 c0                   xor    %eax,%eax
+    193c:       e9 3b ff ff ff          jmp    187c <DeduBB.master.0>        # bb 4: tail call
+
+0000000000001884 <DeduBB.cr.masters>:
+    1884:       48 b9 15 7c 4a 7f b9    movabs $0x9e3779b97f4a7c15,%rcx      # DeduBB.master.cr.1
+    188b:       79 37 9e
+    188e:       48 0f af c1             imul   %rcx,%rax
+    1892:       49 89 06                mov    %rax,(%r14)
+    1895:       48 89 c7                mov    %rax,%rdi
+    1898:       48 89 de                mov    %rbx,%rsi
+    189b:       e8 50 00 00 00          call   18f0 <_Z3mixmm>
+    18a0:       48 89 c1                mov    %rax,%rcx
+    18a3:       48 c1 e9 1f             shr    $0x1f,%rcx
+    18a7:       48 31 c1                xor    %rax,%rcx
+    18aa:       49 89 4e 08             mov    %rcx,0x8(%r14)
+    18ae:       48 8d 0c 18             lea    (%rax,%rbx,1),%rcx
+    18b2:       49 89 4e 10             mov    %rcx,0x10(%r14)
+    18b6:       a8 01                   test   $0x1,%al
+    18b8:       c3                      ret
+```
+
+`cr_block_2` shrinks from 93 to 49 bytes and `cr_block_1` from 93 to 52; the routine they share takes 53. A body without calls needs only the 5-byte `call`.
+
+A block calls the master only if the compiler can tell that its own instructions produce the master's bytes: as many instructions as Step 1 decoded, the same callees, and no operand that the linker fills in other than a call's target. Otherwise the block keeps its body. The master is emitted from the directive's bytes rather than copied from its block, since the linker rewrites some code (for example thread-local accesses), so a block's instructions do not always match its bytes.
+
 ---
 
 ## 2. Step-by-Step Commands
@@ -199,14 +295,14 @@ Run the offline Propeller analysis on the binary. It reads the `BBAddrMap`, disa
 $GEN --binary=test_lto_labels --dedubb_profile=dedubb_directives.txt
 ```
 
-Other options: `--dedubb_cold_only` (only blocks with zero post-link frequency), `--dedubb_intra_module_only` (only folds within a module), and `--dedubb_skip_aliased_functions` (default `true`: leave alone functions whose address carries more than one name, i.e. aliases and functions merged by `--icf`, so the linker can still merge them). The older spellings `--tail_call_profile`, `--tail_call_dedup_cold_only` and `--tail_call_dedup_intra_module_only` still work but are deprecated.
+Other options: `--dedubb_call_return` (also write Call-Return directives; see below), `--dedubb_call_return_estimate` (only log what it would save), `--dedubb_cold_only` (only blocks with zero post-link frequency), `--dedubb_intra_module_only` (only folds within a module), and `--dedubb_skip_aliased_functions` (default `true`: leave alone functions whose address carries more than one name, i.e. aliases and functions merged by `--icf`, so the linker can still merge them). The older spellings `--tail_call_profile`, `--tail_call_dedup_cold_only` and `--tail_call_dedup_intra_module_only` still work but are deprecated.
 
 You should see:
 
 ```
 DeduBB: skipping 0 function(s) whose address carries more than one name (aliases or identical-code-folded functions)
 DeduBB tail-call dedup: 7 candidate blocks, 2 master group(s), 2 fold(s), ~22 bytes saved; wrote dedubb_directives.txt
-DeduBB save-and-jump: 4 blocks scanned; rejected: branch=0, call=0, r10/r11=0, rip-relative=0, rsp=0, system=0, no-successor=0, jump-only=0, decode-error=0
+DeduBB save-and-jump: 4 blocks scanned; rejected: branch=0, call=0, r11=0, r10=0, rip-relative=0, rsp=0, system=0, no-successor=0, jump-only=0, decode-error=0
 DeduBB save-and-jump, one exit: 2 eligible, 1 master group(s), 1 fold(s), ~10 bytes saved
 DeduBB save-and-jump, two exits: 2 eligible, 1 master group(s), 1 fold(s), ~23 bytes saved
 ```
@@ -267,3 +363,54 @@ Then check that the program still computes the same results. `main` calls both f
 ./test_deduplicated > after.txt
 diff before.txt after.txt && echo "same output"
 ```
+
+### Call-Return
+
+The same four steps for the Call-Return example, with `--dedubb_call_return` in Step 2:
+
+```bash
+$CLANGXX -g -O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld -Wl,--lto-basic-block-address-map \
+    cr_test1.cpp cr_test2.cpp -o cr_lto_labels
+$GEN --binary=cr_lto_labels --dedubb_profile=cr_directives.txt --dedubb_call_return
+$CLANGXX -g -O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld -Wl,--lto-basic-block-address-map \
+    -Wl,-mllvm,-dedubb-directives=cr_directives.txt cr_test1.cpp cr_test2.cpp -o cr_deduplicated
+objdump -d cr_deduplicated | awk '/^[0-9a-f]+ <(_Z10cr_block_|DeduBB)/,/^$/'
+./cr_lto_labels > cr_before.txt && ./cr_deduplicated > cr_after.txt && diff cr_before.txt cr_after.txt && echo "same output"
+```
+
+Step 2 adds a Call-Return report to its log:
+
+```
+DeduBB call-return: 9 blocks scanned, 0 red-zone function(s); rejected: branch=0, rsp=1, rip-relative=0, system=0, unresolved-call=0, returns-twice=0, tls=0, prefixed-call=0, red-zone=0, empty=0, decode-error=0
+DeduBB call-return, no call in the body: 6 eligible, 0 master group(s), 0 stub(s)
+DeduBB call-return, calls in the body: 2 eligible, 1 master group(s), 2 stub(s)
+DeduBB call-return: ~29 bytes saved in .text; masters in 1 module(s), ~-3 bytes with one FDE each
+```
+
+and writes, next to the tail-call fold of the return block:
+
+```
+m cr_test1.cpp
+f _Z10cr_block_1mPm
+bbmcr 1 (DeduBB.master.cr.1) callees=_Z3mixmm insts=13 body=48b9157c4a7fb979379e480fafc14989064889c74889de.4889c148c1e91f4831c149894e08488d0c1849894e10a801
+m cr_test2.cpp
+f _Z10cr_block_2mPm
+bbfcr 1 (DeduBB.master.cr.1) callees=_Z3mixmm insts=13
+```
+
+`callees=` lists the body's calls in order (`|` separates the names of one target, `*` stands for an indirect call) and `insts=` its instruction count; the compiler checks both against every block. `body=` holds the master's bytes, split by `.` where each direct call goes.
+
+## 3. Results on clang
+
+`reproduce_dedubb_clang.sh` builds clang twice, once with the BBAddrMap and once with the DeduBB directives, and compares them. By default both builds use `-Oz -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--icf=all`, and Step 1 runs with `--dedubb_call_return`. `DEDUBB_SIZE_OPT=0` builds at `-O3`, and `DEDUBB_CALL_RETURN=0` leaves out Call-Return.
+
+| clang-23 `.text` (bytes) | Baseline | Tail call + Save-and-Jump | + Call-Return |
+|---|---|---|---|
+| `-Oz`, `--gc-sections`, `--icf=all` | 37,946,290 | 37,459,018 (−1.28%) | 37,193,206 (**−1.98%**) |
+| `-O3` | 84,477,871 | 82,550,399 (−2.28%) | 78,373,918 (**−7.23%**) |
+
+`llvm-size` (text + read-only data + unwind tables): `-Oz` 69,214,012 → 67,966,180 (−1.80%); `-O3` 114,901,597 → 108,386,992 (−5.67%).
+
+At `-Oz`, most locals are addressed from `%rsp`, which rules out Call-Return for those blocks (440K of the 1.05M blocks); they stay with Save-and-Jump.
+
+Both Call-Return clangs were checked against their baselines: `--help` works; `-O2 -S` of `APInt.cpp`, `StringRef.cpp`, `raw_ostream.cpp`, `X86InstrInfo.cpp`, `DeduBB.cpp` and `DeduBBCallReturn.cpp` gives identical assembly; no identical-code-folding group is split; and an audit of every Call-Return master and call site finds nothing amiss. The `-O3` one also compiles 490 LLVM and clang sources (`llvm/lib/{Support,IR,Analysis}`, InstCombine, SelectionDAG, parts of clang's Sema and AST) to byte-identical objects.
