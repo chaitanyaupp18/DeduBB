@@ -7,8 +7,8 @@
 
 DeduBB removes duplicate machine code across a whole program. It finds basic
 blocks, and runs of instructions inside blocks, that are identical anywhere in
-a linked binary, keeps one copy of each (the master), and turns every other
-copy into a jump or a call to it.
+a linked binary, keeps one copy (the master), and turns every other copy into
+a jump or a call to it.
 
 Paper: [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
 Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
@@ -16,20 +16,51 @@ Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
 ## How it works
 
 1. **Find.** Propeller's `generate_propeller_profiles` reads a binary built with
-   `-fbasic-block-address-map` and writes a directive file that names the
-   duplicates by function and basic block.
-2. **Fold.** The program is built again with the directives, and passes in
-   LLVM's code generator replace each duplicate.
+   `-fbasic-block-address-map` and writes a directive file.
+2. **Fold.** The program is built again with the directives, and LLVM's code
+   generator replaces each duplicate.
 
 | Fold | Duplicate | Becomes |
 | --- | --- | --- |
 | Tail call | a block, or its last instructions, ending in a return or a tail call | a `jmp` to the master |
-| Save-and-Jump | a block, or a run of instructions in it, that use the stack | a `jmp` to the master, which jumps back through `%r11` |
+| Save-and-Jump | a block, or a run of instructions in it, that may use the stack but makes no calls | a `jmp` to the master, which jumps back through `%r11` |
 | Call-Return | a block's body, or a run of instructions in it, that may make calls but leaves the stack alone | a `call` to the master, which returns |
 
-A `call` moves `%rsp`, so a Call-Return master cannot run code that addresses
-the stack. Save-and-Jump pushes nothing: its master runs in the duplicate's own
-frame, so it takes that code (spills, reloads, stack arguments, red-zone data).
+Folding part of a block, its last instructions or a run inside it, is
+*subsequence folding*.
+
+## Directive file
+
+From [`examples/seq_test1.cpp`, `examples/seq_test2.cpp`](examples) (`body=`
+shortened):
+
+```
+m seq_test1.cpp
+f _Z9seq_end_1Pmm
+bbm 0 (DeduBB.master.0) callees=_Z10seq_reportPmm at=2 block_insts=7
+f _Z9seq_mix_1Pmm
+bbmcr 0 (DeduBB.master.cr.1) callees= insts=14 at=2 block_insts=18 body=4889f048c1e81f...
+m seq_test2.cpp
+f _Z9seq_end_2Pmm
+bbf 0 (DeduBB.master.0) callees=_Z10seq_reportPmm at=1 block_insts=6
+f _Z9seq_mix_2Pmm
+bbfcr 0 (DeduBB.master.cr.1) callees= insts=14 at=2 block_insts=18
+f main
+bbmsj 0 (DeduBB.master.sj.4) insts=4 at=29 block_insts=130 body=4c8b442410...
+bbfsj 0 (DeduBB.master.sj.4) insts=4 at=57 block_insts=130
+```
+
+* `m`, `f`: the source file (informational) and the function of the lines below.
+* `bbm` keeps the master, `bbf` folds into it: tail call (no suffix),
+  Call-Return (`cr`) or Save-and-Jump (`sj`).
+* `0`: the block's ID in the basic-block address map. `(DeduBB.master.K)`: the
+  group; its master and folds share `K`.
+* `at=`, `block_insts=`: subsequence folding, from instruction `at` (counting
+  from 0) of a block of `block_insts` instructions, to the end for a tail call.
+  `insts=`: the number of instructions folded. Without `at=`, the whole block is
+  folded.
+* `callees=`: the functions called or jumped to. `body=`: on the master's line,
+  the master's code in hex.
 
 ## Build
 
@@ -48,21 +79,23 @@ cmake -G Ninja -B build && ninja -C build generate_propeller_profiles
 ## Use
 
 ```bash
-FLAGS="-O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld -Wl,--lto-basic-block-address-map"
+FLAGS="-O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld \
+       -Wl,--lto-basic-block-address-map -Wl,-z,keep-text-section-prefix"
 clang++ $FLAGS a.cpp b.cpp -o app
 generate_propeller_profiles --binary=app --dedubb_profile=dedubb.txt --dedubb_subsequence
 clang++ $FLAGS -Wl,-mllvm,-dedubb-directives=dedubb.txt a.cpp b.cpp -o app.dedubb
 ```
 
 Both builds need the same sources, compiler and flags. Without
-`--dedubb_subsequence`, only whole blocks are folded. `examples/` holds small
-programs with each kind of duplicate.
+`--dedubb_subsequence`, only whole blocks are folded. With
+`-z keep-text-section-prefix`, the masters get a section of their own,
+`.text.dedubb`.
 
-## Reproducing on clang
+## Optimizing clang
 
-`reproduce_dedubb_clang.sh` builds clang at `-Oz` with `--gc-sections` and
-`--icf=all`, once as the baseline and once with DeduBB (and, for comparison,
-with LLVM's MachineOutliner), and writes the sizes to
+`optimize_clang.sh` builds clang at `-Oz` with `--gc-sections` and `--icf=all`:
+as the baseline, with DeduBB, and, for comparison, with LLVM's MachineOutliner
+(one and two rounds). It writes the sizes to
 `clang_dedubb_binaries/Results/sizes_clang_dedup.txt`.
 
 ## Citation
@@ -82,5 +115,5 @@ with LLVM's MachineOutliner), and writes the sizes to
 }
 ```
 
-}
-```
+Rerunning the MachineOutliner (`-machine-outliner-reruns=5`) didn't help: it
+made clang larger in both modes.

@@ -11,3 +11,15 @@ __attribute__((noinline)) unsigned long seq_mix_1(unsigned long *p,
     p[1] = h;
     return h + p[2];
 }
+
+extern unsigned long seq_report(unsigned long *p, unsigned long x);
+
+// A tail-call ending: seq_end_2 (seq_test2.cpp) ends the same way, with the
+// same tail call, after a start of its own.
+__attribute__((noinline)) unsigned long seq_end_1(unsigned long *p,
+                                                  unsigned long x) {
+    p[3] = x * 7;
+    p[0] += x;
+    p[1] ^= x;
+    return seq_report(p, x + p[2]);
+}

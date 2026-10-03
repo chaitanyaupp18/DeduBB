@@ -4,8 +4,9 @@
 ##
 ## This script automatically clones LLVM and Propeller, applies the DeduBB patches,
 ## and compiles a pristine LLVM compiler to evaluate the deduplication savings
-## (tail-call folds, one- and two-exit Save-and-Jump folds, and Call-Return folds
-## of whole block bodies or of ranges, runs of instructions inside blocks).
+## (tail-call, one- and two-exit Save-and-Jump, and Call-Return folds, of whole
+## blocks or, with subsequence folding, of the endings of tail-call blocks and of
+## runs of instructions inside blocks).
 ##
 ## Both clang builds (the BBAddrMap baseline and the DeduBB build) are optimized for
 ## size: -Oz, one section per function and datum, --gc-sections and --icf=all. The
@@ -104,12 +105,15 @@ if [[ "${DEDUBB_SIZE_OPT}" == 1 ]]; then
   SIZE_LDFLAGS="-Wl,--gc-sections -Wl,--icf=all"
 fi
 
+# -z keep-text-section-prefix gives DeduBB's masters (.text.dedubb) an output
+# section of their own, as it does .text.startup and .text.unlikely in every build.
+LD_FLAGS="-fuse-ld=lld -Wl,--lto-basic-block-address-map -Wl,-z,keep-text-section-prefix ${SIZE_LDFLAGS}"
 INSTRUMENTED_PROPELLER_CC_LD_CMAKE_FLAGS=(
   "-DCMAKE_C_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map ${SIZE_CFLAGS}"
   "-DCMAKE_CXX_FLAGS=-funique-internal-linkage-names -fbasic-block-address-map ${SIZE_CFLAGS}"
-  "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}"
-  "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}"
-  "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld -Wl,--lto-basic-block-address-map ${SIZE_LDFLAGS}" )
+  "-DCMAKE_EXE_LINKER_FLAGS=${LD_FLAGS}"
+  "-DCMAKE_SHARED_LINKER_FLAGS=${LD_FLAGS}"
+  "-DCMAKE_MODULE_LINKER_FLAGS=${LD_FLAGS}" )
 
 PATH_TO_BBADDRMAP_CLANG_BUILD=${BASE_DIR}/bbaddrmap_clang_build
 mkdir -p ${PATH_TO_BBADDRMAP_CLANG_BUILD} && cd ${PATH_TO_BBADDRMAP_CLANG_BUILD}
@@ -123,11 +127,15 @@ ninja clang
 # --dedubb_call_return adds Call-Return folds: a block's body, calls included, moves
 # into one shared routine that every copy calls. Blocks that qualify for both get it
 # instead of Save-and-Jump, whose stubs are larger.
-# --dedubb_subsequence folds ranges instead of whole bodies: every run of
-# instructions that repeats anywhere in the program, with the instructions before
-# and after it left in place. Save-and-Jump gets the blocks that hold no range. With
-# both flags, the directives are the same as with --dedubb_subsequence alone, and
-# the log also shows what whole-body Call-Return would save.
+# --dedubb_subsequence turns on subsequence folding, in place of whole blocks and
+# bodies: the longest ending that a block ending in a return or a tail call shares
+# with another, which jumps into it, and every run of instructions that repeats
+# anywhere in the program, moved into a master that copies call (Call-Return) or
+# jump to with their return point in %r11 (Save-and-Jump), whichever saves more.
+# The instructions around a folded subsequence stay in place. Whole-block
+# Save-and-Jump gets the blocks that hold none. With both flags, the directives are
+# the same as with --dedubb_subsequence alone, and the log also shows what
+# whole-body Call-Return would save.
 DEDUBB_FLAGS=()
 if [[ "${DEDUBB_CALL_RETURN}" == 1 ]]; then
   DEDUBB_FLAGS+=("--dedubb_call_return")
@@ -190,11 +198,12 @@ fi
 # 9. Measure Sizes
 SIZES=${PATH_TO_ALL_RESULTS}/sizes_clang_dedup.txt
 LLVM_SIZE=${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-size
-# report TITLE BINARY: llvm-size's text, data and bss, and the .text section.
+# report TITLE BINARY: llvm-size's text, data and bss, and the code sections
+# (.text, .text.dedubb, .text.startup, ...).
 report() {
   printf "%s\n" "$1" >> ${SIZES}
   ${LLVM_SIZE} "$2" >> ${SIZES}
-  ${LLVM_SIZE} -A "$2" | grep '^\.text ' >> ${SIZES}
+  ${LLVM_SIZE} -A "$2" | grep '^\.text' >> ${SIZES}
 }
 BASELINE=${PATH_TO_BBADDRMAP_CLANG_BUILD}/bin/clang-${CLANG_VERSION}
 BUILDS=("DeduBB:${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION}")
@@ -210,18 +219,30 @@ for build in "${BUILDS[@]}"; do
   report "${build%%:*} Stats" "${build#*:}"
 done
 
-# Side by side: .text and llvm-size's text (code, read-only data and unwind tables),
-# and their change from the baseline.
+# Side by side, in bytes, with the change from the baseline:
+#   code (.text*): all machine code, the .text sections together;
+#   read-only text: llvm-size's text, the read-only part of the loaded program
+#     (code, constants and unwind tables);
+#   stripped file: the file's size on disk once llvm-strip has removed the symbol
+#     table and the other sections that are not loaded, as a release ships it. The
+#     stripped copies are written next to the builds.
+LLVM_STRIP=${PATH_TO_TRUNK_LLVM_INSTALL}/bin/llvm-strip
 text_of() { ${LLVM_SIZE} "$1" | awk 'NR == 2 {print $1}'; }
-dot_text_of() { ${LLVM_SIZE} -A "$1" | awk '$1 == ".text" {print $2}'; }
+dot_text_of() { ${LLVM_SIZE} -A "$1" | awk '$1 ~ /^\.text/ {s += $2} END {print s}'; }
+stripped_of() { ${LLVM_STRIP} -o "$1.stripped" "$1" && stat -c %s "$1.stripped"; }
 BASE_TEXT=$(text_of ${BASELINE})
 BASE_DOT_TEXT=$(dot_text_of ${BASELINE})
-printf "\n%-30s %12s %9s %12s %9s\n" "" ".text" "" "text" "" >> ${SIZES}
-printf "%-30s %12d %9s %12d %9s\n" "Baseline" ${BASE_DOT_TEXT} "" ${BASE_TEXT} "" >> ${SIZES}
+BASE_STRIPPED=$(stripped_of ${BASELINE})
+printf "\n%-30s %14s %9s %14s %9s %14s %9s\n" "" "code (.text*)" "" "read-only text" "" "stripped file" "" >> ${SIZES}
+printf "%-30s %14d %9s %14d %9s %14d %9s\n" "Baseline" ${BASE_DOT_TEXT} "" ${BASE_TEXT} "" ${BASE_STRIPPED} "" >> ${SIZES}
 for build in "${BUILDS[@]}"; do
   awk -v name="${build%%:*}" -v d="$(dot_text_of "${build#*:}")" -v t="$(text_of "${build#*:}")" \
-      -v bd=${BASE_DOT_TEXT} -v bt=${BASE_TEXT} \
-      'BEGIN { printf "%-30s %12d %+8.2f%% %12d %+8.2f%%\n", name, d, 100 * (d - bd) / bd, t, 100 * (t - bt) / bt }' >> ${SIZES}
+      -v s="$(stripped_of "${build#*:}")" -v bd=${BASE_DOT_TEXT} -v bt=${BASE_TEXT} -v bs=${BASE_STRIPPED} \
+      'BEGIN { printf "%-30s %14d %+8.2f%% %14d %+8.2f%% %14d %+8.2f%%\n", name, d, 100 * (d - bd) / bd, t, 100 * (t - bt) / bt, s, 100 * (s - bs) / bs }' >> ${SIZES}
 done
+printf "\n%s\n%s\n%s\n" \
+  "code (.text*): all machine code. read-only text: llvm-size's text, the read-only part" \
+  "of the loaded program (code, constants, unwind tables). stripped file: the size on" \
+  "disk, as ls -l shows it, of the binary after llvm-strip, as a release ships it." >> ${SIZES}
 
 cat ${SIZES}

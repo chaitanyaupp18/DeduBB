@@ -1,5 +1,5 @@
 diff --git a/propeller/BUILD b/propeller/BUILD
-index 1f64add..c9bb4d3 100644
+index 1f64add..e0be929 100644
 --- a/propeller/BUILD
 +++ b/propeller/BUILD
 @@ -991,6 +991,117 @@ cc_library(
@@ -41,6 +41,7 @@ index 1f64add..c9bb4d3 100644
 +    srcs = ["subsequence_dedupper_test.cc"],
 +    deps = [
 +        ":call_return_dedupper",
++        ":save_and_jump_dedupper",
 +        ":subsequence_dedupper",
 +        ":tail_call_dedupper",
 +        "@com_google_googletest//:gtest_main",
@@ -93,7 +94,6 @@ index 1f64add..c9bb4d3 100644
 +        ":subsequence_dedupper",
 +        ":tail_call_dedupper",
 +        "@abseil-cpp//absl/container:flat_hash_map",
-+        "@abseil-cpp//absl/container:flat_hash_set",
 +        "@abseil-cpp//absl/log",
 +        "@abseil-cpp//absl/status",
 +        "@abseil-cpp//absl/status:statusor",
@@ -183,7 +183,7 @@ index a7a055a..b13eaf9 100644
    DEPS
      # keep-sorted start
 diff --git a/propeller/generate_propeller_profiles.cc b/propeller/generate_propeller_profiles.cc
-index 34c7b30..30c744f 100644
+index 34c7b30..868c001 100644
 --- a/propeller/generate_propeller_profiles.cc
 +++ b/propeller/generate_propeller_profiles.cc
 @@ -29,6 +29,13 @@
@@ -213,7 +213,7 @@ index 34c7b30..30c744f 100644
  #include "propeller/text_proto_flag.h"
  
  namespace {
-@@ -65,6 +74,45 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
+@@ -65,6 +74,51 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
            "\"PERF_SPE\", \"FREQUENCIES_PROTO\").");
  ABSL_FLAG(std::string, cc_profile, "", "Output cc profile");
  ABSL_FLAG(std::string, ld_profile, "", "Output ld profile");
@@ -241,13 +241,19 @@ index 34c7b30..30c744f 100644
 +          "Log what --dedubb_call_return would do, without writing any "
 +          "Call-Return directives.");
 +ABSL_FLAG(bool, dedubb_subsequence, false,
-+          "Write Call-Return directives for ranges (x86-64): every run of "
-+          "instructions that repeats anywhere in the program, not only whole "
-+          "block bodies, moves into one shared routine that each copy calls. "
-+          "Replaces --dedubb_call_return's whole-body directives.");
++          "Write range directives (x86-64): runs of instructions that repeat "
++          "anywhere in the program, not only whole blocks. Tail-call endings "
++          "are shared in place, and runs inside blocks move into one shared "
++          "routine that each copy calls (Call-Return) or jumps to "
++          "(Save-and-Jump). Replaces whole-block tail-call and "
++          "--dedubb_call_return's whole-body directives.");
 +ABSL_FLAG(bool, dedubb_subsequence_estimate, false,
 +          "Log what --dedubb_subsequence would do, without writing any range "
 +          "directives.");
++ABSL_FLAG(std::string, dedubb_subsequence_kinds, "tc,cr,sj",
++          "The kinds of range --dedubb_subsequence writes, ','-separated: tc "
++          "(tail-call endings), cr (Call-Return runs), sj (Save-and-Jump "
++          "runs).");
 +// Deprecated spellings of the three flags above, from when DeduBB only folded
 +// tail calls. They still work, with a warning.
 +ABSL_FLAG(std::string, tail_call_profile, "",
@@ -259,7 +265,7 @@ index 34c7b30..30c744f 100644
  ABSL_FLAG(propeller::TextProtoFlag<propeller::PropellerOptions>,
            propeller_options, {},
            "Override for propeller options (debug only).");
-@@ -122,6 +170,32 @@ int main(int argc, char* argv[]) {
+@@ -122,6 +176,34 @@ int main(int argc, char* argv[]) {
    options.set_binary_name(absl::GetFlag(FLAGS_binary));
    options.set_cluster_out_name(absl::GetFlag(FLAGS_cc_profile));
    options.set_symbol_order_out_name(absl::GetFlag(FLAGS_ld_profile));
@@ -289,10 +295,12 @@ index 34c7b30..30c744f 100644
 +  options.set_dedubb_subsequence(absl::GetFlag(FLAGS_dedubb_subsequence));
 +  options.set_dedubb_subsequence_estimate(
 +      absl::GetFlag(FLAGS_dedubb_subsequence_estimate));
++  options.set_dedubb_subsequence_kinds(
++      absl::GetFlag(FLAGS_dedubb_subsequence_kinds));
  
    for (const std::string& profile : absl::GetFlag(FLAGS_profile)) {
      InputProfile* input_profile = options.add_input_profiles();
-@@ -130,5 +204,14 @@ int main(int argc, char* argv[]) {
+@@ -130,5 +212,14 @@ int main(int argc, char* argv[]) {
          ToProtoProfileType(absl::GetFlag(FLAGS_profile_type)));
    }
  
@@ -397,7 +405,7 @@ index 61f6643..89e9ea1 100644
  }
  }  // namespace
 diff --git a/propeller/propeller_options.proto b/propeller/propeller_options.proto
-index 5be1683..8fe1c8c 100644
+index 5be1683..f2f8cbc 100644
 --- a/propeller/propeller_options.proto
 +++ b/propeller/propeller_options.proto
 @@ -33,7 +33,7 @@ message InputProfile {
@@ -409,7 +417,7 @@ index 5be1683..8fe1c8c 100644
  message PropellerOptions {
    // binary file name.
    string binary_name = 1;
-@@ -92,6 +92,48 @@ message PropellerOptions {
+@@ -92,6 +92,55 @@ message PropellerOptions {
  
    // Write the basic block hash in the cluster file.
    bool write_bb_hash = 18 [default = false];
@@ -445,25 +453,32 @@ index 5be1683..8fe1c8c 100644
 +  // Call-Return directives.
 +  bool dedubb_call_return_estimate = 24 [default = false];
 +
-+  // When true, write Call-Return directives for ranges (`at=`, `block_insts=`):
-+  // every run of instructions that repeats anywhere in the program, not only
-+  // whole bodies, moves into one shared routine that each copy calls. They
-+  // replace whole-body Call-Return directives. Blocks holding a range get no
-+  // Save-and-Jump directive.
++  // When true, write range directives (`at=`, `block_insts=`, x86-64): runs
++  // of instructions that repeat anywhere in the program, not only whole
++  // blocks or bodies. Tail-call endings are shared in place and replace
++  // whole-block tail-call directives; runs inside blocks move into one shared
++  // routine that each copy calls (Call-Return) or jumps to and is jumped back
++  // from (Save-and-Jump), and replace whole-body Call-Return directives.
++  // Blocks holding a range get no whole-block Save-and-Jump directive.
 +  bool dedubb_subsequence = 25 [default = false];
 +
 +  // When true, log what `dedubb_subsequence` would do without writing any
 +  // range directives.
 +  bool dedubb_subsequence_estimate = 26 [default = false];
++
++  // The kinds of range `dedubb_subsequence` writes, ','-separated: `tc`
++  // (tail-call endings), `cr` (Call-Return runs) and `sj` (Save-and-Jump
++  // runs). Without `tc`, tail calls are folded as whole blocks.
++  string dedubb_subsequence_kinds = 27 [default = "tc,cr,sj"];
  }
  
  // Next Available: 15.
 diff --git a/propeller/tail_call_dedupper.cc b/propeller/tail_call_dedupper.cc
 new file mode 100644
-index 0000000..3a70597
+index 0000000..1810f7e
 --- /dev/null
 +++ b/propeller/tail_call_dedupper.cc
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,229 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -681,6 +696,12 @@ index 0000000..3a70597
 +      out += " callees=";
 +      out += d.callees;
 +    }
++    if (d.range) {
++      out += " at=";
++      out += std::to_string(d.at);
++      out += " block_insts=";
++      out += std::to_string(d.block_insts);
++    }
 +    out += "\n";
 +  }
 +  return out;
@@ -689,10 +710,10 @@ index 0000000..3a70597
 +}  // namespace propeller
 diff --git a/propeller/tail_call_dedupper.h b/propeller/tail_call_dedupper.h
 new file mode 100644
-index 0000000..5883ce8
+index 0000000..b068b0e
 --- /dev/null
 +++ b/propeller/tail_call_dedupper.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,162 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -796,9 +817,10 @@ index 0000000..5883ce8
 +  // instructions in the body, and, for a master, the body itself.
 +  uint32_t inst_count = 0;
 +  std::string body;
-+  // Call-Return ranges only (see `MakeSubsequenceDirectives`): the run is
-+  // instructions `at` to `at + inst_count` of a block of `block_insts`
-+  // instructions, rather than the block's whole body.
++  // Ranges only (see subsequence_dedupper.h): a Call-Return or Save-and-Jump
++  // run is instructions `at` to `at + inst_count` of a block of `block_insts`
++  // instructions, rather than the block's whole body; a tail-call ending is
++  // instructions `at` to the end.
 +  bool range = false;
 +  uint32_t at = 0;
 +  uint32_t block_insts = 0;
@@ -844,8 +866,10 @@ index 0000000..5883ce8
 +//   f <function>
 +//   bbm <id> (DeduBB.master.<K>)
 +//   bbf <id> (DeduBB.master.<K>) callees=<c>
++//   bbf <id> (DeduBB.master.<K>) callees=<c> at=<i> block_insts=<n>
 +//
-+// `callees=` lists the group's call and jump targets, if it has any.
++// `callees=` lists the group's call and jump targets, if it has any, and
++// `at=`/`block_insts=` mark the shared ending of a range directive.
 +// `m`/`f` headers are emitted whenever the module/function changes.
 +std::string FormatDirectives(const TailCallDedupResult& result);
 +
@@ -1068,10 +1092,10 @@ index 0000000..3265b69
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer.cc b/propeller/tail_call_profile_writer.cc
 new file mode 100644
-index 0000000..c267967
+index 0000000..8c48ed3
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer.cc
-@@ -0,0 +1,1878 @@
+@@ -0,0 +1,2340 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1093,6 +1117,7 @@ index 0000000..c267967
 +#include <cstdint>
 +#include <fstream>
 +#include <initializer_list>
++#include <limits>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -1101,11 +1126,11 @@ index 0000000..c267967
 +#include <vector>
 +
 +#include "absl/container/flat_hash_map.h"
-+#include "absl/container/flat_hash_set.h"
 +#include "absl/log/log.h"
 +#include "absl/status/status.h"
 +#include "absl/status/statusor.h"
 +#include "absl/strings/str_format.h"
++#include "absl/strings/str_split.h"
 +#include "absl/strings/string_view.h"
 +#include "llvm/ADT/ArrayRef.h"
 +#include "llvm/ADT/SmallVector.h"
@@ -1122,6 +1147,7 @@ index 0000000..c267967
 +#include "llvm/Object/ObjectFile.h"
 +#include "llvm/Object/SymbolicFile.h"
 +#include "llvm/Support/Casting.h"
++#include "llvm/Support/Endian.h"
 +#include "llvm/Support/Error.h"
 +#include "llvm/TargetParser/Triple.h"
 +#include "propeller/bb_addr_map.h"
@@ -1450,6 +1476,82 @@ index 0000000..c267967
 +  const llvm::MCRegister rsp_;
 +};
 +
++// True if the binary is marked for indirect branch tracking: its
++// `.note.gnu.property` sets GNU_PROPERTY_X86_FEATURE_1_IBT, which the linker
++// does only if every input has it. An indirect jump must then land on an
++// `endbr`, which Save-and-Jump's return points do not have.
++bool HasIndirectBranchTracking(const llvm::object::ObjectFile& object_file) {
++  using llvm::support::endian::read32le;
++  const auto align8 = [](size_t n) { return (n + 7) & ~size_t{7}; };
++  for (const llvm::object::SectionRef& section : object_file.sections()) {
++    llvm::Expected<llvm::StringRef> name = section.getName();
++    if (!name) {
++      llvm::consumeError(name.takeError());
++      continue;
++    }
++    if (*name != ".note.gnu.property") continue;
++    llvm::Expected<llvm::StringRef> contents = section.getContents();
++    if (!contents) {
++      llvm::consumeError(contents.takeError());
++      return false;
++    }
++    // Notes of 64-bit ELF: n_namesz, n_descsz, n_type, then the name and the
++    // descriptor, each padded to 8 bytes; the descriptor holds properties,
++    // pr_type and pr_datasz, then pr_data, padded to 8 bytes.
++    const llvm::StringRef data = *contents;
++    for (size_t at = 0; at + 12 <= data.size();) {
++      const uint32_t namesz = read32le(data.data() + at);
++      const uint32_t descsz = read32le(data.data() + at + 4);
++      const uint32_t type = read32le(data.data() + at + 8);
++      const size_t desc = at + 12 + align8(namesz);
++      const size_t next = desc + align8(descsz);
++      if (next > data.size()) break;
++      if (type == llvm::ELF::NT_GNU_PROPERTY_TYPE_0 && namesz == 4 &&
++          data.substr(at + 12, 4) == llvm::StringRef("GNU\0", 4)) {
++        for (size_t p = desc; p + 8 <= desc + descsz;) {
++          const uint32_t pr_type = read32le(data.data() + p);
++          const uint32_t pr_datasz = read32le(data.data() + p + 4);
++          if (pr_type == llvm::ELF::GNU_PROPERTY_X86_FEATURE_1_AND &&
++              pr_datasz >= 4 && p + 12 <= desc + descsz)
++            return read32le(data.data() + p + 8) &
++                   llvm::ELF::GNU_PROPERTY_X86_FEATURE_1_IBT;
++          p += 8 + align8(pr_datasz);
++        }
++      }
++      at = next;
++    }
++  }
++  return false;
++}
++
++// The addresses an operand may hold as an absolute address, which the
++// compiler holds as a symbol and the linker fills in: those of the loaded
++// segments of an executable that is not position independent. None for a
++// position-independent executable or a shared object, whose code holds no
++// absolute address. [begin, end).
++std::pair<uint64_t, uint64_t> AbsoluteAddressRange(
++    const llvm::object::ObjectFile& object_file) {
++  const auto* elf =
++      llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(&object_file);
++  if (elf == nullptr ||
++      elf->getELFFile().getHeader().e_type != llvm::ELF::ET_EXEC)
++    return {0, 0};
++  constexpr std::pair<uint64_t, uint64_t> kAll = {
++      0, std::numeric_limits<uint64_t>::max()};
++  auto headers = elf->getELFFile().program_headers();
++  if (!headers) {
++    llvm::consumeError(headers.takeError());
++    return kAll;
++  }
++  uint64_t begin = std::numeric_limits<uint64_t>::max(), end = 0;
++  for (const auto& header : *headers) {
++    if (header.p_type != llvm::ELF::PT_LOAD) continue;
++    begin = std::min<uint64_t>(begin, header.p_vaddr);
++    end = std::max<uint64_t>(end, header.p_vaddr + header.p_memsz);
++  }
++  return begin < end ? std::make_pair(begin, end) : kAll;
++}
++
 +// Size of a Save-and-Jump fold site, or 0 if the backend cannot apply
 +// Save-and-Jump on the target. Only x86-64 has link register hooks (%r11,
 +// %r10): `leaq Succ(%rip),%r11` (7) + `jmp DeduBB.master.sj.K` (5).
@@ -1714,6 +1816,24 @@ index 0000000..c267967
 +  return false;
 +}
 +
++// Functions the compiler reaches through pseudo-instructions (return thunks,
++// retpolines, LVI thunks, the thread-local storage resolver) rather than
++// through a call or jump it can check.
++bool IsThunk(llvm::StringRef names) {
++  if (AnyNameIn(names, {"__tls_get_addr", "___tls_get_addr"})) return true;
++  llvm::SmallVector<llvm::StringRef, 4> parts;
++  names.split(parts, '|');
++  for (llvm::StringRef part : parts)
++    if (part.starts_with("__x86_return_thunk") ||
++        part.starts_with("__x86_indirect_thunk") ||
++        part.starts_with("__x86_indirect_call_thunk") ||
++        part.starts_with("__x86_indirect_jump_thunk") ||
++        part.starts_with("__llvm_retpoline_") ||
++        part.starts_with("__llvm_lvi_thunk_"))
++      return true;
++  return false;
++}
++
 +// Rules to relax when estimating what a wider Call-Return could save. No
 +// directive is ever written for a block that needed one.
 +struct CallReturnRelax {
@@ -1735,40 +1855,175 @@ index 0000000..c267967
 +// The trailing branches stay in the block, after the stub.
 +class CallReturnAnalyzer {
 + public:
++  // `absolute_addresses` is the span of addresses that an operand may hold as
++  // an absolute address (AbsoluteAddressRange).
 +  CallReturnAnalyzer(
 +      MiniDisassembler& disassembler,
 +      const absl::flat_hash_map<uint64_t, std::string>& callee_names,
-+      const SymbolNameIndex& symbol_names)
++      const SymbolNameIndex& symbol_names,
++      std::pair<uint64_t, uint64_t> absolute_addresses = {0, 0})
 +      : disassembler_(disassembler),
 +        mii_(disassembler.instr_info()),
 +        mri_(disassembler.register_info()),
 +        callee_names_(callee_names),
 +        symbol_names_(symbol_names),
++        absolute_addresses_(absolute_addresses),
 +        rip_(FindRegister("RIP")),
 +        rsp_(FindRegister("RSP")),
 +        ssp_(FindRegister("SSP")),
 +        fs_(FindRegister("FS")),
-+        gs_(FindRegister("GS")) {}
++        gs_(FindRegister("GS")),
++        r11_(FindRegister("R11")) {}
 +
 +  bool IsValid() const {
-+    return rip_.isValid() && rsp_.isValid() && fs_.isValid() && gs_.isValid();
++    return rip_.isValid() && rsp_.isValid() && fs_.isValid() &&
++           gs_.isValid() && r11_.isValid();
 +  }
 +
-+  // Decodes the block `bytes` at `address` into `insts`. Returns false on a
-+  // decode error.
++  // True if a Save-and-Jump range may hold instruction `decoded`: its master
++  // runs it at another address but in the block's own frame, between the
++  // stub's `lea 1f(%rip),%r11; jmp` and its own `jmp *%r11`. So it must not
++  // call (a call clobbers %r11), branch, touch %r11, depend on its address
++  // (%rip-relative or absolute operands, or thread-local storage the linker
++  // rewrites) or move %rsp; reading and writing stack slots is fine.
++  bool IsSaveAndJumpRunnable(const DecodedInst& decoded) const {
++    const llvm::MCInst& inst = decoded.inst;
++    const llvm::MCInstrDesc& desc = mii_.get(inst.getOpcode());
++    const llvm::StringRef name = mii_.getName(inst.getOpcode());
++    if (IsSystem(desc, name) || IsShadowStack(inst, desc, name)) return false;
++    if (desc.isCall() || desc.mayAffectControlFlow(inst, mri_) ||
++        desc.isBranch() || desc.isIndirectBranch() || desc.isReturn())
++      return false;
++    if (Touches(inst, desc, r11_)) return false;
++    if (OperandsOverlap(inst, rip_) || IsAbsolute(inst) ||
++        UsesTlsSegment(inst))
++      return false;
++    return !Defines(inst, desc, rsp_);
++  }
++
++  // Decides whether instruction `decoded` of a block that ends in a return or
++  // a tail call (`last` if it is the block's last) can be part of an ending
++  // shared in place (a tail-call suffix, see subsequence_dedupper.h). Another
++  // block jumps to it and runs it in its own frame, so only its address may
++  // not matter: no %rip-relative or absolute operand, no thread-local access
++  // (code the linker rewrites, and that the compiler holds as a symbol), and
++  // no branch but the final return or tail jump, which may only jump to a
++  // named function: `callee` receives its names (and `direct` says it is a
++  // direct jump, whose target the compiler checks). No call either: an
++  // exception or a backtrace through it would unwind the block's frame with
++  // the unwind rules of the master's function, which describe that frame only
++  // if both functions address it alike (with a frame pointer or without) and
++  // both have unwind tables. The compiler finds an ending by counting
++  // instructions back from the end, so it must also be one instruction it
++  // emits as one: no no-op padding. And it must reference no symbol other than
++  // the callee, which in a binary that is not position independent rules out
++  // operands that may be absolute addresses: those in `absolute_addresses`.
++  // If it can, appends its key to `key`: its bytes, with a direct jump's
++  // displacement replaced by the absolute target.
++  bool ClassifyTailCallInstruction(const DecodedInst& decoded,
++                                   llvm::ArrayRef<uint8_t> bytes,
++                                   uint64_t address, bool last,
++                                   std::vector<uint8_t>& key,
++                                   std::string& callee, bool& direct) const {
++    const llvm::MCInst& inst = decoded.inst;
++    const llvm::MCInstrDesc& desc = mii_.get(inst.getOpcode());
++    const llvm::StringRef name = mii_.getName(inst.getOpcode());
++    const llvm::ArrayRef<uint8_t> inst_bytes =
++        bytes.slice(decoded.offset, decoded.size);
++    key.clear();
++    callee.clear();
++    direct = false;
++    if (desc.isCall() || IsSystem(desc, name) ||
++        IsShadowStack(inst, desc, name))
++      return false;
++    // No-ops are padding the compiler emits from pseudo-instructions that
++    // stand for several instructions (patchable entries, XRay sleds), and
++    // `lfence` comes from hardening passes that run after DeduBB's (load value
++    // injection rewrites a `ret` into three instructions): where they are, the
++    // compiler could not find an ending's first instruction by counting.
++    if (name.starts_with("NOOP") || name == "LFENCE") return false;
++    if (OperandsOverlap(inst, rip_) || IsAbsolute(inst) ||
++        UsesTlsSegment(inst))
++      return false;
++    const auto [absolute_begin, absolute_end] = absolute_addresses_;
++    for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
++      const llvm::MCOperand& op = inst.getOperand(i);
++      if (op.isImm() &&
++          static_cast<uint64_t>(op.getImm()) - absolute_begin <
++              absolute_end - absolute_begin)
++        return false;
++    }
++    uint64_t target = 0;
++    const bool evaluable = disassembler_.instr_analysis().evaluateBranch(
++        inst, address + decoded.offset, decoded.size, target);
++    // The names a direct jump reaches `target` by, if it is a function the
++    // master may reach from anywhere.
++    const auto named_target = [&]() -> const std::string* {
++      if (!evaluable) return nullptr;
++      const auto it = callee_names_.find(target);
++      if (it == callee_names_.end() || IsReturnsTwice(it->second) ||
++          IsCallerSensitive(it->second) || IsThunk(it->second))
++        return nullptr;
++      return &it->second;
++    };
++    if (desc.mayAffectControlFlow(inst, mri_) || desc.isBranch() ||
++        desc.isIndirectBranch() || desc.isReturn()) {
++      if (!last) return false;
++      if (name == "JMP_1" || name == "JMP_4") {
++        const std::string* names = named_target();
++        if (names == nullptr) return false;
++        const size_t width = name == "JMP_1" ? 1 : 4;
++        if (inst_bytes.size() <= width) return false;
++        key.assign(inst_bytes.begin(), inst_bytes.end() - width);
++        for (int i = 0; i < 8; ++i)
++          key.push_back(static_cast<uint8_t>(target >> (8 * i)));
++        callee = *names;
++        direct = true;
++        return true;
++      }
++      if (name == "JMP64r" || name == "JMP64m" || name == "JMP64r_NT" ||
++          name == "JMP64m_NT" || name == "RET64" || name == "RETI64") {
++        key.assign(inst_bytes.begin(), inst_bytes.end());
++        return true;
++      }
++      return false;
++    }
++    key.assign(inst_bytes.begin(), inst_bytes.end());
++    return true;
++  }
++
++  // Decodes the block `bytes` at `address` into `insts`, one for each
++  // instruction the compiler emits, which is how directives count them. The
++  // disassembler returns some prefixes, such as `lock`, as instructions of
++  // their own: each goes with the instruction it prefixes, whose offset and
++  // size then include it. Returns false on a decode error.
 +  bool Decode(llvm::ArrayRef<uint8_t> bytes, uint64_t address,
 +              std::vector<DecodedInst>& insts) const {
 +    insts.clear();
++    uint64_t start = 0;  // Where the next instruction's prefixes start.
 +    for (uint64_t offset = 0; offset < bytes.size();) {
 +      uint64_t size = 0;
 +      absl::StatusOr<llvm::MCInst> inst = disassembler_.DisassembleOne(
 +          bytes.drop_front(offset), address + offset, size);
 +      if (!inst.ok() || size == 0 || offset + size > bytes.size()) return false;
-+      insts.push_back({*std::move(inst), static_cast<uint32_t>(offset),
-+                       static_cast<uint32_t>(size)});
 +      offset += size;
++      if (mii_.getName(inst->getOpcode()).ends_with("_PREFIX")) continue;
++      insts.push_back({*std::move(inst), static_cast<uint32_t>(start),
++                       static_cast<uint32_t>(offset - start)});
++      start = offset;
 +    }
-+    return true;
++    return start == bytes.size();  // No prefix without its instruction.
++  }
++
++  // True if instruction `j` of `insts` follows one that addresses memory
++  // through %fs or %gs. The linker rewrites some thread-local accesses, each
++  // of which the compiler emits as one pseudo-instruction, into such an
++  // instruction and the one after it (`mov %fs:0,%rax; lea x@tpoff(%rax),%rax`
++  // for a general-dynamic access), so the compiler may not count that
++  // instruction as one of its own.
++  bool FollowsTlsAccess(const std::vector<DecodedInst>& insts,
++                        size_t j) const {
++    return j > 0 && UsesTlsSegment(insts[j - 1].inst);
 +  }
 +
 +  // True if the code keeps data in the red zone below %rsp: a memory operand,
@@ -1858,11 +2113,7 @@ index 0000000..c267967
 +    if (desc.mayAffectControlFlow(inst, mri_) || desc.isBranch() ||
 +        desc.isIndirectBranch() || desc.isReturn())
 +      return CallReturnReject::kBranch;
-+    if ((ssp_.isValid() && Touches(inst, desc, ssp_)) ||
-+        name.starts_with("RDSSP") || name.starts_with("INCSSP") ||
-+        name.starts_with("SAVEPREVSSP") || name.starts_with("RSTORSSP") ||
-+        name.starts_with("WRSS") || name.starts_with("WRUSS") ||
-+        name.starts_with("SETSSBSY") || name.starts_with("CLRSSBSY"))
++    if (IsShadowStack(inst, desc, name))
 +      return CallReturnReject::kStackPointer;
 +    if (Touches(inst, desc, rsp_)) {
 +      if (!relax.stack_base || !OnlyAsMemoryBase(inst, desc, rsp_))
@@ -2109,6 +2360,31 @@ index 0000000..c267967
 +    return llvm::MCRegister();
 +  }
 +
++  // True if the instruction reads or writes the shadow-stack pointer.
++  bool IsShadowStack(const llvm::MCInst& inst, const llvm::MCInstrDesc& desc,
++                     llvm::StringRef name) const {
++    return (ssp_.isValid() && Touches(inst, desc, ssp_)) ||
++           name.starts_with("RDSSP") || name.starts_with("INCSSP") ||
++           name.starts_with("SAVEPREVSSP") || name.starts_with("RSTORSSP") ||
++           name.starts_with("WRSS") || name.starts_with("WRUSS") ||
++           name.starts_with("SETSSBSY") || name.starts_with("CLRSSBSY");
++  }
++
++  // Writes `reg`, explicitly or implicitly.
++  bool Defines(const llvm::MCInst& inst, const llvm::MCInstrDesc& desc,
++               llvm::MCRegister reg) const {
++    for (unsigned i = 0; i < desc.getNumDefs() && i < inst.getNumOperands();
++         ++i) {
++      const llvm::MCOperand& op = inst.getOperand(i);
++      if (op.isReg() && op.getReg().isValid() &&
++          mri_.regsOverlap(op.getReg(), reg))
++        return true;
++    }
++    for (llvm::MCPhysReg r : desc.implicit_defs())
++      if (mri_.regsOverlap(r, reg)) return true;
++    return false;
++  }
++
 +  // True if a symbol at an address other than `target` has one of the
 +  // '|'-separated `names` of a callee at `target`.
 +  bool NamesAnotherSymbol(llvm::StringRef names, uint64_t target) const {
@@ -2147,11 +2423,13 @@ index 0000000..c267967
 +  const llvm::MCRegisterInfo& mri_;
 +  const absl::flat_hash_map<uint64_t, std::string>& callee_names_;
 +  const SymbolNameIndex& symbol_names_;
++  const std::pair<uint64_t, uint64_t> absolute_addresses_;
 +  const llvm::MCRegister rip_;
 +  const llvm::MCRegister rsp_;
 +  const llvm::MCRegister ssp_;
 +  const llvm::MCRegister fs_;
 +  const llvm::MCRegister gs_;
++  const llvm::MCRegister r11_;
 +};
 +
 +// Builds the Call-Return candidates. Every block of a function qualifies
@@ -2291,23 +2569,27 @@ index 0000000..c267967
 +  return candidates;
 +}
 +
-+// Builds the input of the subsequence finder (subsequence_dedupper.h): every
-+// instruction of every block, with a key if a Call-Return master can run it
-+// (CallReturnAnalyzer::ClassifyInstruction). A block holds no run, and all of
-+// its instructions are barriers, if it is an EH pad, a block of a tail-call
-+// group (`tail_call_blocks`, by function name and block id), in a function
-+// that keeps data in the red zone, or, with `cold_only`, hot. An undecodable
-+// block has no instructions, so the compiler folds nothing in it either. The
-+// entry block takes part: the compiler folds a range there only after the
-+// prologue. Functions named `DeduBB.*` (the masters of a previous run) are
-+// left out.
++// Builds the input of the range finder (subsequence_dedupper.h): every
++// instruction of every block, with the kinds of range of `kinds` that may hold
++// it (Call-Return: CallReturnAnalyzer::ClassifyInstruction; Save-and-Jump:
++// CallReturnAnalyzer::IsSaveAndJumpRunnable) and its key. A block holds no
++// range if it is an EH pad or, with `cold_only`, hot, and no Call-Return range
++// if its function keeps data in the red zone, where the stub's call writes.
++// Instructions from `reserved_from` on, by function name and block id, belong
++// to a tail-call fold (a whole block, or an ending shared in place) and hold
++// none. An undecodable block has no instructions, so the compiler folds
++// nothing in it either. The entry block takes part: the compiler folds a
++// range there only after the prologue. Functions named `DeduBB.*` (the
++// masters of a previous run) are left out. `sj_runnable` counts the
++// instructions a Save-and-Jump range may hold.
 +SubsequenceInput BuildSubsequenceInput(
 +    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
 +    const SymbolNameIndex& symbol_names, bool cold_only,
-+    bool skip_aliased_functions,
-+    const absl::flat_hash_set<std::pair<std::string, uint32_t>>&
-+        tail_call_blocks,
-+    CallReturnScanStats& stats, int64_t& left_out_blocks) {
++    bool skip_aliased_functions, uint8_t kinds,
++    const absl::flat_hash_map<std::pair<std::string, uint32_t>, uint32_t>&
++        reserved_from,
++    CallReturnScanStats& stats, int64_t& left_out_blocks,
++    int64_t& sj_runnable) {
 +  SubsequenceInput input;
 +  absl::StatusOr<std::unique_ptr<MiniDisassembler>> disassembler =
 +      MiniDisassembler::Create(binary_content.object_file.get());
@@ -2379,29 +2661,143 @@ index 0000000..c267967
 +          ++left_out_blocks;
 +          continue;
 +        }
-+        const bool usable =
-+            !red_zone && !bb_entry.is_eh_pad() &&
-+            !tail_call_blocks.contains({function_name, bb_entry.id()}) &&
++        const bool range_ok =
++            !bb_entry.is_eh_pad() &&
 +            !(cold_only && (bb_entry.post_link_frequency() > 0 ||
 +                            bb_entry.frequency() > 0));
-+        if (!usable) ++left_out_blocks;
-+        for (const DecodedInst& inst : d.insts) {
++        const bool cr_ok = range_ok && !red_zone && (kinds & kRunCallReturn);
++        const bool sj_ok = range_ok && (kinds & kRunSaveAndJump);
++        const auto reserved =
++            reserved_from.find(std::make_pair(function_name, bb_entry.id()));
++        const uint32_t reserved_at =
++            reserved == reserved_from.end()
++                ? std::numeric_limits<uint32_t>::max()
++                : reserved->second;
++        if ((!cr_ok && !sj_ok) || reserved_at == 0) ++left_out_blocks;
++        for (uint32_t j = 0; j < d.insts.size(); ++j) {
++          const DecodedInst& inst = d.insts[j];
 +          key.clear();
++          callee.clear();
 +          bool direct_call = false;
-+          CallReturnReject reject = CallReturnReject::kSystem;
-+          if (usable) {
-+            ++stats.scanned;
-+            reject = analyzer.ClassifyInstruction(inst, d.bytes, d.address,
-+                                                  key, callee, direct_call);
-+            ++stats.by_reason[static_cast<int>(reject)];
-+          }
-+          if (reject != CallReturnReject::kNone) {
-+            key.clear();
-+            callee.clear();
-+            direct_call = false;
++          uint8_t inst_kinds = 0;
++          // Possibly made by the linker out of a thread-local access.
++          const bool after_tls = analyzer.FollowsTlsAccess(d.insts, j);
++          if (j < reserved_at) {
++            if (cr_ok) {
++              ++stats.scanned;
++              const CallReturnReject reject =
++                  after_tls ? CallReturnReject::kTls
++                            : analyzer.ClassifyInstruction(
++                                  inst, d.bytes, d.address, key, callee,
++                                  direct_call);
++              ++stats.by_reason[static_cast<int>(reject)];
++              if (reject == CallReturnReject::kNone) {
++                inst_kinds |= kRunCallReturn;
++              } else {
++                key.clear();
++                callee.clear();
++                direct_call = false;
++              }
++            }
++            if (sj_ok && !after_tls && analyzer.IsSaveAndJumpRunnable(inst)) {
++              // A Call-Return key, if any, is the instruction's bytes too: it
++              // makes no call.
++              if (!(inst_kinds & kRunCallReturn))
++                key.assign(d.bytes.begin() + inst.offset,
++                           d.bytes.begin() + inst.offset + inst.size);
++              inst_kinds |= kRunSaveAndJump;
++              ++sj_runnable;
++            }
 +          }
 +          input.AddInstruction(key, static_cast<uint8_t>(inst.size),
-+                               direct_call, callee);
++                               direct_call, callee, inst_kinds);
++        }
++      }
++    }
++  }
++  return input;
++}
++
++// Builds the input of the tail-call suffix finder (subsequence_dedupper.h):
++// the blocks that end in a return or a tail call, picked as for whole-block
++// tail-call folds but for conditional tail calls, which keep a successor, with
++// every instruction that an ending shared in place may hold
++// (CallReturnAnalyzer::ClassifyTailCallInstruction) and its key. `scanned`
++// counts the blocks, `shareable` the instructions that may be shared.
++SubsequenceInput BuildTailCallSuffixInput(
++    const BbAddrMapPb& bb_addr_map, const BinaryContent& binary_content,
++    const SymbolNameIndex& symbol_names, bool cold_only,
++    bool skip_aliased_functions, int64_t& scanned, int64_t& shareable) {
++  SubsequenceInput input;
++  absl::StatusOr<std::unique_ptr<MiniDisassembler>> disassembler =
++      MiniDisassembler::Create(binary_content.object_file.get());
++  if (!disassembler.ok()) {
++    LOG(WARNING) << "DeduBB tail-call suffixes skipped: "
++                 << disassembler.status().message();
++    return input;
++  }
++  const absl::flat_hash_map<uint64_t, std::string> callee_names =
++      BuildCalleeNames(binary_content, (*disassembler)->subtarget_info());
++  const CallReturnAnalyzer analyzer(
++      **disassembler, callee_names, symbol_names,
++      AbsoluteAddressRange(*binary_content.object_file));
++  if (!analyzer.IsValid()) {
++    LOG(WARNING) << "DeduBB tail-call suffixes skipped: registers not found";
++    return input;
++  }
++  std::vector<uint8_t> key;
++  std::string callee;
++  std::vector<DecodedInst> insts;
++  for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps()) {
++    for (const FunctionBbAddrMapPb& function :
++         module.function_bb_addr_maps()) {
++      if (skip_aliased_functions && IsAliased(function)) continue;
++      const std::string function_name =
++          function.function_names().empty()
++              ? std::string(absl::StrFormat("0x%lx", function.function_address()))
++              : std::string(function.function_names(0));
++      if (llvm::StringRef(function_name).starts_with("DeduBB.")) continue;
++      std::string mod_name = std::string(module.module_name());
++      if (mod_name.empty()) {
++        size_t uniq_pos = function_name.find(".__uniq.");
++        if (uniq_pos != std::string::npos) {
++          mod_name = function_name.substr(uniq_pos + 8);
++        }
++      }
++      for (const BbRangePb& bb_range : function.bb_ranges()) {
++        for (const BbEntryPb& bb_entry : bb_range.bb_entries()) {
++          if (!bb_entry.has_tail_call() && !bb_entry.has_return()) continue;
++          if (bb_entry.size() == 0 || bb_entry.is_eh_pad() ||
++              bb_entry.can_fall_through())
++            continue;
++          if (cold_only && (bb_entry.post_link_frequency() > 0 ||
++                            bb_entry.frequency() > 0))
++            continue;
++          const uint64_t address = bb_range.base_address() + bb_entry.offset();
++          absl::StatusOr<std::vector<uint8_t>> bytes = GetBlockBytes(
++              *binary_content.object_file, address, bb_entry.size());
++          if (!bytes.ok() || !analyzer.Decode(*bytes, address, insts)) continue;
++          ++scanned;
++          input.AddBlock(mod_name, function_name, bb_entry.id(), address,
++                         std::max(static_cast<uint64_t>(
++                                      bb_entry.post_link_frequency()),
++                                  static_cast<uint64_t>(bb_entry.frequency())));
++          for (size_t j = 0; j < insts.size(); ++j) {
++            bool direct = false;
++            const bool ok =
++                !analyzer.FollowsTlsAccess(insts, j) &&
++                analyzer.ClassifyTailCallInstruction(
++                    insts[j], *bytes, address, j + 1 == insts.size(), key,
++                    callee, direct);
++            if (!ok) {
++              key.clear();
++              callee.clear();
++              direct = false;
++            }
++            shareable += ok;
++            input.AddInstruction(key, static_cast<uint8_t>(insts[j].size),
++                                 direct, callee, ok ? kRunCallReturn : 0);
++          }
 +        }
 +      }
 +    }
@@ -2650,11 +3046,16 @@ index 0000000..c267967
 +  SaveAndJumpScanStats sj_stats;
 +  SaveAndJumpCandidates sj_blocks;
 +  const int sj_patch_size = SaveAndJumpPatchSize(*binary_content);
-+  if (sj_patch_size > 0) {
++  const bool branch_tracking =
++      HasIndirectBranchTracking(*binary_content->object_file);
++  if (sj_patch_size > 0 && !branch_tracking) {
 +    sj_blocks = BuildSaveAndJumpBlocks(bb_addr_map, *binary_content,
 +                                       opts.dedubb_cold_only(),
 +                                       opts.dedubb_skip_aliased_functions(),
 +                                       sj_stats);
++  } else if (branch_tracking) {
++    LOG(INFO) << "DeduBB save-and-jump: not used, the binary is built for "
++                 "indirect branch tracking";
 +  } else {
 +    LOG(INFO) << "DeduBB save-and-jump: not supported for this target";
 +  }
@@ -2691,40 +3092,93 @@ index 0000000..c267967
 +  const TailCallDedupResult result =
 +      DeduplicateTailCallBlocks(blocks, dedup_options);
 +
-+  // Ranges (x86-64 only): every run of instructions that repeats anywhere,
-+  // after the tail-call folds, whose blocks they leave alone, and before
-+  // Save-and-Jump, which gets the blocks that hold no range. With
-+  // `dedubb_subsequence` they replace whole-body Call-Return folds, which are
-+  // the runs that cover a body; `dedubb_subsequence_estimate` only logs them.
++  // Ranges (x86-64 only), written with `dedubb_subsequence` and only logged
++  // with `dedubb_subsequence_estimate`. Of the kinds `dedubb_subsequence_kinds`
++  // names: tail-call endings shared in place first, which replace whole-block
++  // tail-call folds; then Call-Return and Save-and-Jump runs in the rest of
++  // every block, which replace whole-body Call-Return folds; then, below,
++  // whole-block Save-and-Jump on the blocks that hold no range.
 +  const bool subsequence = opts.dedubb_subsequence();
 +  const bool subsequence_estimate =
 +      subsequence || opts.dedubb_subsequence_estimate();
++  bool tc_kind = false;
++  uint8_t run_kinds = 0;
++  for (absl::string_view kind :
++       absl::StrSplit(opts.dedubb_subsequence_kinds(), ',', absl::SkipEmpty())) {
++    if (kind == "tc") {
++      tc_kind = true;
++    } else if (kind == "cr") {
++      run_kinds |= kRunCallReturn;
++    } else if (kind == "sj") {
++      run_kinds |= kRunSaveAndJump;
++    } else {
++      return absl::InvalidArgumentError(absl::StrFormat(
++          "unknown kind '%s' in --dedubb_subsequence_kinds", kind));
++    }
++  }
++  const bool x86_64 =
++      binary_content->object_file->getArch() == llvm::Triple::x86_64;
++  if (branch_tracking) run_kinds &= ~kRunSaveAndJump;
++  if (subsequence_estimate && !x86_64)
++    LOG(INFO) << "DeduBB subsequence: not supported for this target";
++
++  // Tail-call endings.
++  const bool tc_suffixes = subsequence_estimate && x86_64 && tc_kind;
++  TailCallSuffixResult tc_suffix;
++  std::vector<Directive> tc_suffix_directives;
++  int64_t tc_suffix_scanned = 0, tc_suffix_shareable = 0;
++  if (tc_suffixes) {
++    const SubsequenceInput tc_input = BuildTailCallSuffixInput(
++        bb_addr_map, *binary_content, symbol_names, opts.dedubb_cold_only(),
++        opts.dedubb_skip_aliased_functions(), tc_suffix_scanned,
++        tc_suffix_shareable);
++    TailCallSuffixOptions tc_options;
++    tc_options.patch_size = TailCallPatchSize(*binary_content);
++    tc_options.intra_module_only = opts.dedubb_intra_module_only();
++    tc_suffix = FindTailCallSuffixes(tc_input, tc_options);
++    tc_suffix_directives = MakeTailCallSuffixDirectives(
++        tc_input, tc_suffix, /*first_master_id=*/0);
++  }
++  // With ranges, the masters of the other kinds are numbered after the
++  // tail-call ones that are written with them.
++  const uint64_t seq_tc_masters =
++      tc_suffixes ? tc_suffix.groups.size() : result.num_masters;
++
 +  SubsequenceResult seq_result;
 +  std::vector<Directive> seq_directives;
 +  std::vector<uint64_t> seq_stub_addresses;
 +  int seq_master_modules = 0;
 +  CallReturnScanStats seq_stats;
 +  int64_t seq_left_out_blocks = 0;
++  int64_t seq_sj_runnable = 0;
 +  uint64_t seq_blocks = 0;
-+  if (subsequence_estimate) {
-+    if (binary_content->object_file->getArch() == llvm::Triple::x86_64) {
-+      absl::flat_hash_set<std::pair<std::string, uint32_t>> tail_call_blocks;
-+      for (const Directive& d : result.directives)
-+        tail_call_blocks.insert({d.function_name, d.bb_id});
-+      const SubsequenceInput input = BuildSubsequenceInput(
-+          bb_addr_map, *binary_content, symbol_names, opts.dedubb_cold_only(),
-+          opts.dedubb_skip_aliased_functions(), tail_call_blocks, seq_stats,
-+          seq_left_out_blocks);
-+      seq_blocks = input.blocks().size();
-+      SubsequenceOptions seq_options;
-+      seq_options.intra_module_only = opts.dedubb_intra_module_only();
-+      seq_result = FindRepeatedRuns(input, seq_options);
-+      seq_directives = MakeSubsequenceDirectives(
-+          input, seq_result, /*first_master_id=*/0, seq_stub_addresses,
-+          seq_master_modules);
++  if (subsequence_estimate && x86_64) {
++    // The instructions tail-call folds keep: from the start of an ending
++    // shared in place (the longest, for a master of several), or whole
++    // blocks.
++    absl::flat_hash_map<std::pair<std::string, uint32_t>, uint32_t>
++        reserved_from;
++    if (tc_suffixes) {
++      for (const Directive& d : tc_suffix_directives) {
++        const auto [it, inserted] = reserved_from.try_emplace(
++            std::make_pair(d.function_name, d.bb_id), d.at);
++        if (!inserted) it->second = std::min(it->second, d.at);
++      }
 +    } else {
-+      LOG(INFO) << "DeduBB subsequence: not supported for this target";
++      for (const Directive& d : result.directives)
++        reserved_from[std::make_pair(d.function_name, d.bb_id)] = 0;
 +    }
++    const SubsequenceInput input = BuildSubsequenceInput(
++        bb_addr_map, *binary_content, symbol_names, opts.dedubb_cold_only(),
++        opts.dedubb_skip_aliased_functions(), run_kinds, reserved_from,
++        seq_stats, seq_left_out_blocks, seq_sj_runnable);
++    seq_blocks = input.blocks().size();
++    SubsequenceOptions seq_options;
++    seq_options.intra_module_only = opts.dedubb_intra_module_only();
++    seq_result = FindRepeatedRuns(input, seq_options);
++    seq_directives = MakeSubsequenceDirectives(
++        input, seq_result, /*first_master_id=*/0, seq_stub_addresses,
++        seq_master_modules);
 +  }
 +
 +  // Save-and-Jump, on all of its candidates and on those Call-Return leaves.
@@ -2766,7 +3220,7 @@ index 0000000..c267967
 +  // Save-and-Jump next to ranges: on the blocks that hold no range.
 +  SaveAndJumpDedupResult sj_seq, sj2_seq;
 +  if (subsequence_estimate) {
-+    sj_options.first_master_id = result.num_masters;
++    sj_options.first_master_id = seq_tc_masters;
 +    sj_seq = DeduplicateSaveAndJumpBlocks(
 +        RemoveBlocksAt(sj_blocks.single_exit, seq_stub_addresses), sj_options);
 +    sj2_options.first_master_id = sj_options.first_master_id + sj_seq.num_masters;
@@ -2787,13 +3241,27 @@ index 0000000..c267967
 +
 +  const std::string out_path(opts.dedubb_profile_out_name());
 +  std::ofstream out(out_path, std::ofstream::out | std::ofstream::trunc);
-+  out << FormatDirectives(result);
++  if (subsequence && tc_suffixes) {
++    TailCallDedupResult tc_ranges;
++    tc_ranges.directives = std::move(tc_suffix_directives);
++    out << FormatDirectives(tc_ranges);
++  } else {
++    out << FormatDirectives(result);
++  }
 +  out << FormatSaveAndJumpDirectives(sj_result);
 +  out << FormatSaveAndJumpDirectives(sj2_result);
 +  if (subsequence) {
-+    CallReturnDedupResult ranges;
-+    ranges.directives = std::move(seq_directives);
-+    out << FormatCallReturnDirectives(ranges);
++    CallReturnDedupResult cr_ranges;
++    SaveAndJumpDedupResult sj_ranges;
++    for (Directive& directive : seq_directives) {
++      if (directive.kind == DirectiveKind::kMasterSaveJump ||
++          directive.kind == DirectiveKind::kFoldSaveJump)
++        sj_ranges.directives.push_back(std::move(directive));
++      else
++        cr_ranges.directives.push_back(std::move(directive));
++    }
++    out << FormatCallReturnDirectives(cr_ranges);
++    out << FormatSaveAndJumpDirectives(sj_ranges);
 +  } else if (call_return) {
 +    out << FormatCallReturnDirectives(cr_result);
 +  }
@@ -2828,7 +3296,18 @@ index 0000000..c267967
 +            << sj2_result.num_groups << " master group(s), "
 +            << sj2_result.num_folds << " fold(s), ~" << sj2_result.bytes_saved
 +            << " bytes saved";
-+  if (subsequence_estimate) {
++  if (tc_suffixes) {
++    LOG(INFO) << "DeduBB tail-call suffixes"
++              << (subsequence ? "" : " (estimate only)") << ": "
++              << tc_suffix_scanned << " blocks scanned, "
++              << tc_suffix_shareable << " instructions shareable, "
++              << tc_suffix.blocks << " blocks with an ending; "
++              << tc_suffix.groups.size() << " group(s), " << tc_suffix.masters
++              << " master block(s), " << tc_suffix.folds << " fold(s) ("
++              << tc_suffix.whole_blocks << " whole blocks), ~"
++              << tc_suffix.bytes_saved << " bytes saved";
++  }
++  if (subsequence_estimate && x86_64) {
 +    LOG(INFO) << "DeduBB subsequence" << (subsequence ? "" : " (estimate only)")
 +              << ": " << seq_stats.scanned << " instructions scanned in "
 +              << seq_blocks << " blocks (" << seq_left_out_blocks
@@ -2836,7 +3315,8 @@ index 0000000..c267967
 +              << " red-zone function(s); rejected: "
 +              << FormatRejects(seq_stats);
 +    LOG(INFO) << "DeduBB subsequence: " << seq_result.runnable
-+              << " instructions a master can run, " << seq_result.distinct
++              << " instructions a master can run (" << seq_sj_runnable
++              << " by Save-and-Jump), " << seq_result.distinct
 +              << " distinct, " << seq_result.repeated << " repeating; "
 +              << seq_result.text_length << " symbols sorted, "
 +              << seq_result.candidates << " candidate runs";
@@ -2854,10 +3334,16 @@ index 0000000..c267967
 +              << seq_result.bytes_saved << " bytes saved in .text; masters in "
 +              << seq_master_modules << " module(s); groups by run length "
 +              << lengths;
++    LOG(INFO) << "DeduBB subsequence, Save-and-Jump runs: "
++              << seq_result.sj_groups << " master group(s), "
++              << seq_result.sj_copies << " copies, ~"
++              << seq_result.sj_bytes_saved << " bytes saved (part of the above)";
++    const int64_t tail_call_bytes =
++        tc_suffixes ? tc_suffix.bytes_saved : result.bytes_saved;
 +    LOG(INFO) << "DeduBB total with subsequence: ~"
-+              << result.bytes_saved + sj_seq.bytes_saved +
-+                     sj2_seq.bytes_saved + seq_result.bytes_saved
-+              << " bytes in .text (tail call ~" << result.bytes_saved
++              << tail_call_bytes + sj_seq.bytes_saved + sj2_seq.bytes_saved +
++                     seq_result.bytes_saved
++              << " bytes in .text (tail call ~" << tail_call_bytes
 +              << ", ranges ~" << seq_result.bytes_saved
 +              << ", save-and-jump ~" << sj_seq.bytes_saved << " + ~"
 +              << sj2_seq.bytes_saved << ")";
@@ -3091,10 +3577,10 @@ index 0000000..91619ba
 +#endif  // PROPELLER_TAIL_CALL_PROFILE_WRITER_H_
 diff --git a/propeller/save_and_jump_dedupper.h b/propeller/save_and_jump_dedupper.h
 new file mode 100644
-index 0000000..e826503
+index 0000000..bc7d8ee
 --- /dev/null
 +++ b/propeller/save_and_jump_dedupper.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,131 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -3218,7 +3704,9 @@ index 0000000..e826503
 +//   bbmsj <id> (DeduBB.master.sj.<K>)     bbmsj2 <id> (DeduBB.master.sj2.<K>)
 +//   bbfsj <id> (DeduBB.master.sj.<K>)     bbfsj2 <id> (DeduBB.master.sj2.<K>)
 +//
-+// `m`/`f` headers are emitted whenever the module/function changes.
++// A range (see subsequence_dedupper.h) adds `insts=<n> at=<i> block_insts=<b>`,
++// and its master's line `body=<hex>`, the run's bytes. `m`/`f` headers are
++// emitted whenever the module/function changes.
 +std::string FormatSaveAndJumpDirectives(const SaveAndJumpDedupResult& result);
 +
 +}  // namespace propeller
@@ -3226,10 +3714,10 @@ index 0000000..e826503
 +#endif  // PROPELLER_SAVE_AND_JUMP_DEDUPPER_H_
 diff --git a/propeller/save_and_jump_dedupper.cc b/propeller/save_and_jump_dedupper.cc
 new file mode 100644
-index 0000000..3925c54
+index 0000000..d13244f
 --- /dev/null
 +++ b/propeller/save_and_jump_dedupper.cc
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,226 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -3437,7 +3925,20 @@ index 0000000..3925c54
 +    out += std::to_string(d.bb_id);
 +    out += two_exit ? " (DeduBB.master.sj2." : " (DeduBB.master.sj.";
 +    out += std::to_string(d.master_id);
-+    out += ")\n";
++    out += ")";
++    if (d.range) {
++      out += " insts=";
++      out += std::to_string(d.inst_count);
++      out += " at=";
++      out += std::to_string(d.at);
++      out += " block_insts=";
++      out += std::to_string(d.block_insts);
++      if (!d.body.empty()) {
++        out += " body=";
++        out += d.body;
++      }
++    }
++    out += "\n";
 +  }
 +  return out;
 +}
@@ -4332,10 +4833,10 @@ index 0000000..bb5c9c1
 +}  // namespace propeller
 diff --git a/propeller/subsequence_dedupper.h b/propeller/subsequence_dedupper.h
 new file mode 100644
-index 0000000..b2c7f27
+index 0000000..63928cb
 --- /dev/null
 +++ b/propeller/subsequence_dedupper.h
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,267 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -4353,34 +4854,50 @@ index 0000000..b2c7f27
 +#ifndef PROPELLER_SUBSEQUENCE_DEDUPPER_H_
 +#define PROPELLER_SUBSEQUENCE_DEDUPPER_H_
 +
-+// DeduBB subsequence deduplication core: Call-Return folds of instruction runs.
++// DeduBB subsequence deduplication core: folds of instruction runs.
 +//
-+// A Call-Return fold (call_return_dedupper.h) moves the body of identical
-+// blocks into one master routine that ends in `ret`. This generalizes it to
-+// any run of consecutive instructions inside a block. Every copy of a run that
-+// repeats in the program becomes a stub that calls one master holding the run,
++// The block-level folds (tail_call_dedupper.h, save_and_jump_dedupper.h,
++// call_return_dedupper.h) share whole blocks or block bodies. These share any
++// run of consecutive instructions that repeats in the program, and leave the
++// rest of each block where it is.
 +//
-+//   call DeduBB.master.cr.K                                (no call in the run)
-+//   push %rax; call DeduBB.master.cr.K; lea 8(%rsp),%rsp   (calls in the run)
++// Ranges. Every copy of a run inside a block becomes a stub that runs one
++// master holding the run and comes back right after the stub:
 +//
-+// and the rest of the block, before and after the run, stays where it is.
++//   Call-Return    call DeduBB.master.cr.K                  (no call in the run)
++//                  push %rax; call DeduBB.master.cr.K; lea 8(%rsp),%rsp
++//                  master: <run>; ret
++//   Save-and-Jump  lea 1f(%rip),%r11; jmp DeduBB.master.sj.K; 1:
++//                  master: <run>; jmp *%r11
++//
++// A Call-Return master runs with %rsp 8 or 16 bytes lower and may call; a
++// Save-and-Jump master runs in the block's own frame and may not (a call
++// clobbers %r11), so it can read and write the block's stack slots.
 +//
 +// The program is one string of tokens, one per instruction. Two instructions
 +// get the same token if they have the same key (see `SubsequenceInput`), which
-+// means that they do the same thing wherever they are. An instruction that a
-+// master cannot run, an instruction whose key occurs once, and the end of
-+// every block are barriers: symbols that occur once, so that no repeated
-+// substring contains one. The repeated substrings are the intervals of the
-+// string's suffix and LCP arrays. Each is costed in bytes,
++// means that they do the same thing wherever they are. An instruction that no
++// master can run, an instruction whose key occurs once, and the end of every
++// block are barriers: symbols that occur once, so that no repeated substring
++// contains one. The repeated substrings are the intervals of the string's
++// suffix and LCP arrays. Each is costed in bytes for the kinds every copy
++// allows,
 +//
-+//   copies * (run bytes - stub) - (run bytes + 1 for the master's `ret`),
++//   copies * (run bytes - stub) - (run bytes + the master's return),
 +//
 +// and they are taken greedily, largest saving first, without the copies that
 +// overlap a run taken before (a lazy greedy: a candidate is costed again when
 +// it comes up, and put back if it no longer comes first).
 +//
++// Tail-call suffixes. Blocks that end in a return or a tail call can share
++// their last instructions in place: a block that ends like a master block
++// replaces that ending with `jmp DeduBB.master.K`, a label in the master block
++// where the shared ending starts. The jump keeps the block's frame, so the
++// ending may restore registers and pop the frame, which no range may. See
++// `FindTailCallSuffixes`.
++//
 +// This header depends only on the C++ standard library, so that it can be
-+// unit-tested alone. Which instructions a master can run is decided with a
++// unit-tested alone. Which instructions a fold can hold is decided with a
 +// disassembler, in tail_call_profile_writer.cc.
 +
 +#include <cstddef>
@@ -4392,6 +4909,12 @@ index 0000000..b2c7f27
 +#include "propeller/tail_call_dedupper.h"
 +
 +namespace propeller {
++
++// Which kinds of range may hold an instruction (`SubsequenceInput`).
++enum RunKind : uint8_t {
++  kRunCallReturn = 1,
++  kRunSaveAndJump = 2,
++};
 +
 +// The program's instructions, block after block.
 +class SubsequenceInput {
@@ -4411,15 +4934,17 @@ index 0000000..b2c7f27
 +                const std::string& function_name, uint32_t bb_id,
 +                uint64_t address, uint64_t frequency);
 +
-+  // Appends an instruction of `size` bytes to the last block. `key` is empty
-+  // for an instruction that no run may hold. Otherwise it is the instruction's
-+  // bytes, except that a direct call's rel32 is replaced by the absolute target
-+  // (`direct_call`, see AppendDirectCallToKey), so that equal keys do the same
-+  // thing wherever they are. `callee` names a call's target ('|' between the
-+  // names of one address, "*" for an indirect call) and is empty for anything
-+  // else.
++  // Appends an instruction of `size` bytes to the last block. `kinds` says
++  // which folds may hold it (`RunKind` bits); it is 0, and `key` empty, for an
++  // instruction that none may. Otherwise `key` is the instruction's bytes,
++  // except that a direct call's or jump's rel32 is replaced by the absolute
++  // target (`direct_call`, see AppendDirectCallToKey), so that equal keys do
++  // the same thing wherever they are. `callee` names a call's or tail jump's
++  // target ('|' between the names of one address, "*" for an indirect call)
++  // and is empty for anything else.
 +  void AddInstruction(const std::vector<uint8_t>& key, uint8_t size,
-+                      bool direct_call, const std::string& callee);
++                      bool direct_call, const std::string& callee,
++                      uint8_t kinds = kRunCallReturn);
 +
 +  size_t num_instructions() const { return size_.size(); }
 +  const std::vector<Block>& blocks() const { return blocks_; }
@@ -4429,6 +4954,7 @@ index 0000000..b2c7f27
 +  size_t key_size(size_t i) const { return key_begin_[i + 1] - key_begin_[i]; }
 +  uint8_t size(size_t i) const { return size_[i]; }
 +  bool direct_call(size_t i) const { return direct_call_[i] != 0; }
++  uint8_t kinds(size_t i) const { return kinds_[i]; }
 +  // The callee of instruction `i` if it is a call, or nullptr.
 +  const std::string* callee(size_t i) const {
 +    return callee_[i] < 0 ? nullptr : &callee_names_[callee_[i]];
@@ -4440,19 +4966,24 @@ index 0000000..b2c7f27
 +  std::vector<uint8_t> key_bytes_;
 +  std::vector<uint8_t> size_;
 +  std::vector<uint8_t> direct_call_;
++  std::vector<uint8_t> kinds_;
 +  std::vector<int32_t> callee_;
 +  std::vector<std::string> callee_names_;
 +  std::unordered_map<std::string, int32_t> callee_ids_;
 +};
 +
 +struct SubsequenceOptions {
-+  // Bytes of a stub for a run without calls: `call rel32`.
++  // Bytes of a Call-Return stub for a run without calls: `call rel32`.
 +  int stub_size = 5;
-+  // Bytes of a stub for a run with calls: `push %rax` (1) + `call rel32` (5) +
-+  // `lea 8(%rsp),%rsp` (5).
++  // Bytes of a Call-Return stub for a run with calls: `push %rax` (1) +
++  // `call rel32` (5) + `lea 8(%rsp),%rsp` (5).
 +  int stub_size_with_calls = 11;
-+  // Bytes the master routine adds besides the run: its `ret`.
++  // Bytes a Call-Return master adds besides the run: its `ret`.
 +  int master_overhead = 1;
++  // Bytes of a Save-and-Jump stub: `lea 1f(%rip),%r11` (7) + `jmp rel32` (5).
++  int sj_stub_size = 12;
++  // Bytes a Save-and-Jump master adds besides the run: its `jmp *%r11`.
++  int sj_master_overhead = 3;
 +  // Minimum number of copies of a run before folding is considered.
 +  int min_occurrences = 2;
 +  // Fold a run only with copies in the same module (`Block::module_name`).
@@ -4465,6 +4996,7 @@ index 0000000..b2c7f27
 +    uint32_t length = 0;      // Instructions in the run.
 +    uint32_t bytes = 0;       // The run's size in bytes.
 +    bool with_calls = false;  // The run makes calls.
++    RunKind kind = kRunCallReturn;
 +    int64_t benefit = 0;      // Bytes saved.
 +    // The index of each copy's first instruction, ascending.
 +    std::vector<uint32_t> starts;
@@ -4479,18 +5011,22 @@ index 0000000..b2c7f27
 +  uint64_t candidates = 0;         // Repeated runs that could save bytes.
 +  uint64_t copies = 0;             // Copies folded, over all groups.
 +  uint64_t copies_with_calls = 0;  // Of those, copies of runs with calls.
++  uint64_t sj_groups = 0;          // Groups folded with Save-and-Jump.
++  uint64_t sj_copies = 0;          // Copies of those.
 +  int64_t bytes_saved = 0;         // Estimated `.text` reduction in bytes.
++  int64_t sj_bytes_saved = 0;      // Of that, by Save-and-Jump groups.
 +};
 +
 +// Finds the runs to fold in `input` (see the comment at the top).
 +SubsequenceResult FindRepeatedRuns(const SubsequenceInput& input,
 +                                   const SubsequenceOptions& options = {});
 +
-+// Turns `result` into Call-Return directives for ranges: one per copy, with
-+// `at=` (the copy's first instruction in its block) and `block_insts=`. Each
-+// group's master is its first copy in the order used for the other kinds
-+// (hottest, then a function without a ThinLTO `.llvm.` suffix, then the
-+// lowest address); its line carries the run's bytes. Masters are numbered from
++// Turns `result` into range directives: Call-Return (`bbmcr`/`bbfcr`) or
++// Save-and-Jump (`bbmsj`/`bbfsj`) ones, by the group's kind, one per copy,
++// with `at=` (the copy's first instruction in its block) and `block_insts=`.
++// Each group's master is its first copy in the order used for the other kinds
++// (hottest, then a function without a ThinLTO `.llvm.` suffix, then the lowest
++// address); its line carries the run's bytes. Masters are numbered from
 +// `first_master_id` in that order. The directives come sorted by module,
 +// function, block and `at=`. `stub_addresses` receives the sorted, distinct
 +// addresses of the blocks holding a copy, and `num_master_modules` the number
@@ -4504,6 +5040,55 @@ index 0000000..b2c7f27
 +// `body=`: its bytes in hex, with a '.' in place of each direct call.
 +std::string FormatSubsequenceBody(const SubsequenceInput& input,
 +                                  uint32_t start, uint32_t length);
++
++struct TailCallSuffixOptions {
++  // Bytes of the jump that replaces a folded ending: x86-64 `jmp rel32`.
++  int patch_size = 5;
++  // Fold an ending only with masters in the same module.
++  bool intra_module_only = false;
++};
++
++struct TailCallSuffixResult {
++  // Blocks that share the ending of one master block: the last `length`
++  // instructions of every block in `folds` become a jump to the label at that
++  // many instructions before the end of `master`, which keeps its code.
++  struct Group {
++    uint32_t master = 0;  // Index into `SubsequenceInput::blocks()`.
++    uint32_t length = 0;  // Instructions in the shared ending.
++    uint32_t bytes = 0;   // Its size in bytes.
++    std::vector<uint32_t> folds;  // Indices into `blocks()`.
++    int64_t benefit = 0;          // Bytes saved.
++  };
++  std::vector<Group> groups;
++
++  uint64_t blocks = 0;          // Blocks with an ending that could be shared.
++  uint64_t masters = 0;         // Blocks that keep their code for others.
++  uint64_t folds = 0;           // Endings replaced by a jump.
++  uint64_t whole_blocks = 0;    // Of those, ones that are the whole block.
++  int64_t bytes_saved = 0;      // Estimated `.text` reduction in bytes.
++};
++
++// Finds the tail-call endings to share. `input` holds the blocks that end in a
++// return or a tail call, with every instruction that may be shared in place
++// (kinds != 0); an ending stops at the last instruction that may not. The
++// endings form a trie, read from the end. Deepest shared nodes first, every
++// node that two blocks reach gets a master: the best of its blocks (in the
++// order of the other kinds), unless one below it has one already, which then
++// serves it too. Every other block folds its longest ending that a master
++// also has, if that saves bytes. A master keeps its code and may serve several
++// endings, one label each; a block is never both a master and a fold.
++TailCallSuffixResult FindTailCallSuffixes(
++    const SubsequenceInput& input, const TailCallSuffixOptions& options = {});
++
++// Turns `result` into tail-call directives (`bbm`/`bbf`) with `at=` (the first
++// instruction of the ending in its block) and `block_insts=`: one `bbm` per
++// group for its master's label and one `bbf` per fold, all with the group's
++// `callees=`. Groups are numbered from `first_master_id` in the order of their
++// masters, then by length, longest first. The directives come sorted by
++// module, function, block and `at=`.
++std::vector<Directive> MakeTailCallSuffixDirectives(
++    const SubsequenceInput& input, const TailCallSuffixResult& result,
++    uint64_t first_master_id);
 +
 +// Exposed for testing. The suffix array of `text`, whose values lie in
 +// [0, alphabet): the start of every suffix, in lexicographic order.
@@ -4521,10 +5106,10 @@ index 0000000..b2c7f27
 +#endif  // PROPELLER_SUBSEQUENCE_DEDUPPER_H_
 diff --git a/propeller/subsequence_dedupper.cc b/propeller/subsequence_dedupper.cc
 new file mode 100644
-index 0000000..a00e3ae
+index 0000000..f49d551
 --- /dev/null
 +++ b/propeller/subsequence_dedupper.cc
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,698 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -4545,6 +5130,7 @@ index 0000000..a00e3ae
 +#include <cstddef>
 +#include <cstdint>
 +#include <limits>
++#include <numeric>
 +#include <queue>
 +#include <set>
 +#include <string>
@@ -4579,6 +5165,19 @@ index 0000000..a00e3ae
 +  }
 +};
 +
++// The order blocks are preferred in as masters, as for the other kinds: the
++// hottest first, then a function without a ThinLTO ".llvm." suffix, then the
++// lowest address.
++bool BlockLess(const SubsequenceInput::Block& x,
++               const SubsequenceInput::Block& y) {
++  if (x.frequency != y.frequency) return x.frequency > y.frequency;
++  const bool x_llvm = x.function_name.find(".llvm.") != std::string::npos;
++  const bool y_llvm = y.function_name.find(".llvm.") != std::string::npos;
++  if (x_llvm != y_llvm) return !x_llvm;
++  return std::tie(x.address, x.module_name, x.function_name, x.bb_id) <
++         std::tie(y.address, y.module_name, y.function_name, y.bb_id);
++}
++
 +}  // namespace
 +
 +void SubsequenceInput::AddBlock(const std::string& module_name,
@@ -4591,12 +5190,16 @@ index 0000000..a00e3ae
 +
 +void SubsequenceInput::AddInstruction(const std::vector<uint8_t>& key,
 +                                      uint8_t size, bool direct_call,
-+                                      const std::string& callee) {
++                                      const std::string& callee,
++                                      uint8_t kinds) {
 +  if (blocks_.empty()) AddBlock("", "", 0, 0, 0);
-+  key_bytes_.insert(key_bytes_.end(), key.begin(), key.end());
++  if (key.empty()) kinds = 0;
++  if (kinds != 0)
++    key_bytes_.insert(key_bytes_.end(), key.begin(), key.end());
 +  key_begin_.push_back(key_bytes_.size());
 +  size_.push_back(size);
 +  direct_call_.push_back(direct_call ? 1 : 0);
++  kinds_.push_back(kinds);
 +  int32_t id = -1;
 +  if (!callee.empty()) {
 +    const auto [it, inserted] = callee_ids_.try_emplace(
@@ -4690,7 +5293,7 @@ index 0000000..a00e3ae
 +  std::vector<int32_t> token(num_insts, -1);
 +  std::vector<uint32_t> occurrences;
 +  for (size_t i = 0; i < num_insts; ++i) {
-+    if (input.key_size(i) == 0) continue;
++    if (input.kinds(i) == 0) continue;
 +    ++result.runnable;
 +    const std::string_view key(reinterpret_cast<const char*>(input.key(i)),
 +                               input.key_size(i));
@@ -4761,20 +5364,35 @@ index 0000000..a00e3ae
 +
 +  const std::vector<int32_t> sa = BuildSuffixArray(text, next_barrier);
 +  const std::vector<int32_t> lcp = BuildLcpArray(text, sa);
-+  // Sizes and calls before each text position, to cost a run in O(1).
++  // Sizes, calls, and instructions that a kind of range may not hold, before
++  // each text position, to cost a run and check a copy in O(1).
 +  std::vector<uint64_t> bytes_before(static_cast<size_t>(n) + 1, 0);
 +  std::vector<uint32_t> calls_before(static_cast<size_t>(n) + 1, 0);
++  std::vector<uint32_t> not_cr_before(static_cast<size_t>(n) + 1, 0);
++  std::vector<uint32_t> not_sj_before(static_cast<size_t>(n) + 1, 0);
 +  for (int32_t p = 0; p < n; ++p) {
 +    const uint32_t i = inst_at[p];
 +    const bool instruction = i != kBarrier;
++    const uint8_t kinds = instruction ? input.kinds(i) : 0;
 +    bytes_before[p + 1] = bytes_before[p] + (instruction ? input.size(i) : 0);
 +    calls_before[p + 1] =
 +        calls_before[p] + (instruction && input.callee(i) != nullptr ? 1 : 0);
++    not_cr_before[p + 1] =
++        not_cr_before[p] + (instruction && !(kinds & kRunCallReturn) ? 1 : 0);
++    not_sj_before[p + 1] =
++        not_sj_before[p] + (instruction && !(kinds & kRunSaveAndJump) ? 1 : 0);
 +  }
++  // A Call-Return run; a Save-and-Jump one never makes calls, and saves less
++  // than a Call-Return one of the same copies would, so the former bounds
++  // both.
 +  const auto benefit = [&](int64_t copies, int64_t bytes, bool with_calls) {
 +    const int64_t stub =
 +        with_calls ? options.stub_size_with_calls : options.stub_size;
 +    return copies * (bytes - stub) - (bytes + options.master_overhead);
++  };
++  const auto sj_benefit = [&](int64_t copies, int64_t bytes) {
++    return copies * (bytes - options.sj_stub_size) -
++           (bytes + options.sj_master_overhead);
 +  };
 +
 +  // Every repeated run is an LCP interval: the suffixes in [lb, rb] of the
@@ -4807,17 +5425,22 @@ index 0000000..a00e3ae
 +  }
 +  result.candidates = candidates.size();
 +
-+  // The copies of `c` that can still be folded: in text order, skipping those
-+  // that overlap a run taken before or the previous copy kept.
++  // The copies of `c` that a range of `kind` can still fold: in text order,
++  // skipping those that hold an instruction the kind may not, and those that
++  // overlap a run taken before or the previous copy kept.
 +  std::vector<uint8_t> taken(n, 0);
 +  std::vector<int32_t> starts;
-+  const auto keep = [&](const Candidate& c, std::vector<int32_t>& kept) {
++  const auto keep = [&](const Candidate& c, RunKind kind,
++                        std::vector<int32_t>& kept) {
++    const std::vector<uint32_t>& banned =
++        kind == kRunCallReturn ? not_cr_before : not_sj_before;
 +    starts.assign(sa.begin() + c.lb, sa.begin() + c.rb + 1);
 +    std::sort(starts.begin(), starts.end());
 +    kept.clear();
 +    int64_t free_from = 0;
 +    for (int32_t p : starts) {
 +      if (p < free_from) continue;
++      if (banned[p + c.length] != banned[p]) continue;
 +      bool clear = true;
 +      for (uint32_t k = 0; k < c.length; ++k) {
 +        if (taken[p + k]) {
@@ -4831,24 +5454,37 @@ index 0000000..a00e3ae
 +    }
 +  };
 +
-+  // Lazy greedy. A candidate's saving only drops as runs are taken, so the
-+  // heap holds upper bounds: the one on top is costed again, taken if it still
-+  // comes first, and put back with its new saving otherwise.
++  // Lazy greedy. A candidate's saving only drops as runs are taken (each kind
++  // keeps as many copies as can be kept, and taken runs only remove copies),
++  // so the heap holds upper bounds: the one on top is costed again, with the
++  // kind that saves more, taken if it still comes first, and put back with its
++  // new saving otherwise.
 +  using Entry = std::pair<int64_t, int32_t>;  // saving, -candidate
 +  std::priority_queue<Entry> heap;
 +  for (int32_t c = 0; c < static_cast<int32_t>(candidates.size()); ++c) {
 +    const Candidate& cand = candidates[c];
 +    heap.push({benefit(cand.rb - cand.lb + 1, cand.bytes, cand.with_calls), -c});
 +  }
-+  std::vector<int32_t> kept;
++  constexpr int64_t kNone = std::numeric_limits<int64_t>::min();
++  std::vector<int32_t> kept_cr, kept_sj;
 +  while (!heap.empty()) {
 +    const auto [bound, neg] = heap.top();
 +    heap.pop();
 +    const Candidate& c = candidates[-neg];
-+    keep(c, kept);
-+    if (static_cast<int>(kept.size()) < options.min_occurrences) continue;
-+    const int64_t saving =
-+        benefit(static_cast<int64_t>(kept.size()), c.bytes, c.with_calls);
++    keep(c, kRunCallReturn, kept_cr);
++    int64_t saving_cr = kNone, saving_sj = kNone;
++    if (static_cast<int>(kept_cr.size()) >= options.min_occurrences)
++      saving_cr = benefit(static_cast<int64_t>(kept_cr.size()), c.bytes,
++                          c.with_calls);
++    // A Save-and-Jump master cannot make calls.
++    if (!c.with_calls) {
++      keep(c, kRunSaveAndJump, kept_sj);
++      if (static_cast<int>(kept_sj.size()) >= options.min_occurrences)
++        saving_sj = sj_benefit(static_cast<int64_t>(kept_sj.size()), c.bytes);
++    }
++    const bool sj = saving_sj > saving_cr;
++    const int64_t saving = sj ? saving_sj : saving_cr;
++    const std::vector<int32_t>& kept = sj ? kept_sj : kept_cr;
 +    if (saving <= 0) continue;
 +    if (!heap.empty() && saving < heap.top().first) {
 +      heap.push({saving, neg});
@@ -4858,6 +5494,7 @@ index 0000000..a00e3ae
 +    group.length = c.length;
 +    group.bytes = c.bytes;
 +    group.with_calls = c.with_calls;
++    group.kind = sj ? kRunSaveAndJump : kRunCallReturn;
 +    group.benefit = saving;
 +    group.starts.reserve(kept.size());
 +    for (int32_t p : kept) {
@@ -4866,6 +5503,11 @@ index 0000000..a00e3ae
 +    }
 +    result.copies += kept.size();
 +    if (c.with_calls) result.copies_with_calls += kept.size();
++    if (sj) {
++      ++result.sj_groups;
++      result.sj_copies += kept.size();
++      result.sj_bytes_saved += saving;
++    }
 +    result.bytes_saved += saving;
 +    result.groups.push_back(std::move(group));
 +  }
@@ -4909,17 +5551,12 @@ index 0000000..a00e3ae
 +    uint32_t at;     // In the block.
 +    uint32_t start;  // In the program.
 +  };
-+  // The order of the other kinds: the hottest first, then a function without a
-+  // ThinLTO ".llvm." suffix, then the lowest address.
++  // The order of the other kinds (BlockLess), then the place in the block.
 +  const auto copy_less = [&](const Copy& a, const Copy& b) {
 +    const Block& x = blocks[a.block];
 +    const Block& y = blocks[b.block];
-+    if (x.frequency != y.frequency) return x.frequency > y.frequency;
-+    const bool x_llvm = x.function_name.find(".llvm.") != std::string::npos;
-+    const bool y_llvm = y.function_name.find(".llvm.") != std::string::npos;
-+    if (x_llvm != y_llvm) return !x_llvm;
-+    return std::tie(x.address, x.module_name, x.function_name, x.bb_id, a.at) <
-+           std::tie(y.address, y.module_name, y.function_name, y.bb_id, b.at);
++    if (a.block != b.block) return BlockLess(x, y);
++    return a.at < b.at;
 +  };
 +  struct Plan {
 +    const SubsequenceResult::Group* group;
@@ -4955,13 +5592,19 @@ index 0000000..a00e3ae
 +        callees += *callee;
 +      }
 +    }
++    const bool sj = group.kind == kRunSaveAndJump;
 +    for (size_t k = 0; k < plan.copies.size(); ++k) {
 +      const Copy& copy = plan.copies[k];
 +      const Block& block = blocks[copy.block];
-+      Directive directive{k == 0 ? DirectiveKind::kMasterCallReturn
-+                                 : DirectiveKind::kFoldCallReturn,
-+                          block.module_name, block.function_name, block.bb_id,
-+                          master_id};
++      DirectiveKind kind;
++      if (sj)
++        kind = k == 0 ? DirectiveKind::kMasterSaveJump
++                      : DirectiveKind::kFoldSaveJump;
++      else
++        kind = k == 0 ? DirectiveKind::kMasterCallReturn
++                      : DirectiveKind::kFoldCallReturn;
++      Directive directive{kind, block.module_name, block.function_name,
++                          block.bb_id, master_id};
 +      directive.callees = callees;
 +      directive.inst_count = group.length;
 +      directive.range = true;
@@ -4988,13 +5631,189 @@ index 0000000..a00e3ae
 +  return directives;
 +}
 +
++TailCallSuffixResult FindTailCallSuffixes(
++    const SubsequenceInput& input, const TailCallSuffixOptions& options) {
++  using Block = SubsequenceInput::Block;
++  TailCallSuffixResult result;
++  const std::vector<Block>& blocks = input.blocks();
++  const uint32_t num_blocks = static_cast<uint32_t>(blocks.size());
++
++  // Tokens: instructions with equal keys (and, within a module only, in the
++  // same module) share one.
++  std::unordered_map<std::string, int32_t> ids;
++  std::unordered_map<std::string_view, uint32_t> module_index;
++  std::string composite;
++  const auto token_of = [&](uint32_t i, uint32_t module) {
++    composite.assign(reinterpret_cast<const char*>(input.key(i)),
++                     input.key_size(i));
++    if (options.intra_module_only)
++      composite.append(reinterpret_cast<const char*>(&module), sizeof(module));
++    const int32_t next = static_cast<int32_t>(ids.size());
++    return ids.try_emplace(composite, next).first->second;
++  };
++
++  // The trie of the blocks' endings, read from the end: a node is an ending
++  // that the blocks through it share.
++  struct Node {
++    int32_t parent = -1;
++    uint32_t depth = 0;   // Instructions.
++    uint32_t bytes = 0;
++    uint32_t count = 0;   // Blocks that end with it.
++    int32_t best = -1;    // Of those, the one preferred as master.
++    int32_t master = -1;  // The master serving it, once there is one.
++  };
++  std::vector<Node> nodes(1);  // The root: the empty ending.
++  std::unordered_map<uint64_t, int32_t> child;  // (node, token) -> node
++  // Each block's nodes, from its last instruction to the start of its ending.
++  std::vector<uint32_t> path_begin(num_blocks + 1, 0);
++  std::vector<int32_t> path;
++  for (uint32_t b = 0; b < num_blocks; ++b) {
++    const Block& block = blocks[b];
++    path_begin[b] = static_cast<uint32_t>(path.size());
++    const uint32_t module =
++        options.intra_module_only
++            ? module_index
++                  .try_emplace(block.module_name,
++                               static_cast<uint32_t>(module_index.size()))
++                  .first->second
++            : 0;
++    int32_t node = 0;
++    for (uint32_t k = 0; k < block.num_insts; ++k) {
++      const uint32_t i = block.first_inst + block.num_insts - 1 - k;
++      if (input.kinds(i) == 0) break;
++      const uint64_t edge = static_cast<uint64_t>(node) << 32 |
++                            static_cast<uint32_t>(token_of(i, module));
++      const auto [it, inserted] =
++          child.try_emplace(edge, static_cast<int32_t>(nodes.size()));
++      if (inserted) {
++        Node next;
++        next.parent = node;
++        next.depth = nodes[node].depth + 1;
++        next.bytes = nodes[node].bytes + input.size(i);
++        nodes.push_back(next);
++      }
++      node = it->second;
++      Node& n = nodes[node];
++      ++n.count;
++      if (n.best < 0 || BlockLess(block, blocks[n.best]))
++        n.best = static_cast<int32_t>(b);
++      path.push_back(node);
++    }
++    if (path.size() > path_begin[b]) ++result.blocks;
++  }
++  path_begin[num_blocks] = static_cast<uint32_t>(path.size());
++
++  // Masters, deepest shared nodes first. A node whose subtree has a master
++  // already is served by it; otherwise its best block becomes one, and serves
++  // every node above too, up to one that has a master. (A master is set on a
++  // node only together with all the nodes above it.)
++  std::vector<int32_t> order(nodes.size() - 1);
++  std::iota(order.begin(), order.end(), 1);
++  std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
++    return nodes[a].depth > nodes[b].depth;
++  });
++  std::vector<uint8_t> is_master(num_blocks, 0);
++  for (int32_t v : order) {
++    if (nodes[v].count < 2 || nodes[v].master >= 0) continue;
++    const int32_t m = nodes[v].best;
++    is_master[m] = 1;
++    for (int32_t u = v; u > 0 && nodes[u].master < 0; u = nodes[u].parent)
++      nodes[u].master = m;
++  }
++
++  // Every other block folds its deepest served ending, the longest one it
++  // shares with a master, if that saves bytes; a shallower one saves less.
++  std::unordered_map<uint64_t, uint32_t> group_of;  // (master, length)
++  std::set<int32_t> used_masters;
++  for (uint32_t b = 0; b < num_blocks; ++b) {
++    if (is_master[b]) continue;
++    for (uint32_t k = path_begin[b + 1]; k > path_begin[b]; --k) {
++      const Node& n = nodes[path[k - 1]];
++      if (n.master < 0) continue;
++      const int64_t saving = static_cast<int64_t>(n.bytes) - options.patch_size;
++      if (saving > 0) {
++        const auto [it, inserted] = group_of.try_emplace(
++            static_cast<uint64_t>(n.master) << 32 | n.depth,
++            static_cast<uint32_t>(result.groups.size()));
++        if (inserted) {
++          TailCallSuffixResult::Group group;
++          group.master = static_cast<uint32_t>(n.master);
++          group.length = n.depth;
++          group.bytes = n.bytes;
++          result.groups.push_back(std::move(group));
++          used_masters.insert(n.master);
++        }
++        TailCallSuffixResult::Group& group = result.groups[it->second];
++        group.folds.push_back(b);
++        group.benefit += saving;
++        ++result.folds;
++        if (n.depth == blocks[b].num_insts) ++result.whole_blocks;
++        result.bytes_saved += saving;
++      }
++      break;
++    }
++  }
++  result.masters = used_masters.size();
++  return result;
++}
++
++std::vector<Directive> MakeTailCallSuffixDirectives(
++    const SubsequenceInput& input, const TailCallSuffixResult& result,
++    uint64_t first_master_id) {
++  using Block = SubsequenceInput::Block;
++  using Group = TailCallSuffixResult::Group;
++  const std::vector<Block>& blocks = input.blocks();
++  std::vector<const Group*> groups;
++  groups.reserve(result.groups.size());
++  for (const Group& group : result.groups) groups.push_back(&group);
++  std::sort(groups.begin(), groups.end(), [&](const Group* a, const Group* b) {
++    if (a->master != b->master)
++      return BlockLess(blocks[a->master], blocks[b->master]);
++    return a->length > b->length;
++  });
++
++  std::vector<Directive> directives;
++  uint64_t master_id = first_master_id;
++  for (const Group* group : groups) {
++    const Block& master = blocks[group->master];
++    // Every block of the group ends with the master's calls and jumps: equal
++    // keys reach equal targets.
++    std::string callees;
++    for (uint32_t i = master.first_inst + master.num_insts - group->length;
++         i < master.first_inst + master.num_insts; ++i) {
++      if (const std::string* callee = input.callee(i)) {
++        if (!callees.empty()) callees += ',';
++        callees += *callee;
++      }
++    }
++    const auto add = [&](DirectiveKind kind, const Block& block) {
++      Directive directive{kind, block.module_name, block.function_name,
++                          block.bb_id, master_id};
++      directive.callees = callees;
++      directive.range = true;
++      directive.at = block.num_insts - group->length;
++      directive.block_insts = block.num_insts;
++      directives.push_back(std::move(directive));
++    };
++    add(DirectiveKind::kMaster, master);
++    for (uint32_t fold : group->folds) add(DirectiveKind::kFold, blocks[fold]);
++    ++master_id;
++  }
++  std::sort(directives.begin(), directives.end(),
++            [](const Directive& a, const Directive& b) {
++              return std::tie(a.module_name, a.function_name, a.bb_id, a.at) <
++                     std::tie(b.module_name, b.function_name, b.bb_id, b.at);
++            });
++  return directives;
++}
++
 +}  // namespace propeller
 diff --git a/propeller/subsequence_dedupper_test.cc b/propeller/subsequence_dedupper_test.cc
 new file mode 100644
-index 0000000..45cdf3e
+index 0000000..c97f593
 --- /dev/null
 +++ b/propeller/subsequence_dedupper_test.cc
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,484 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5018,6 +5837,7 @@ index 0000000..45cdf3e
 +
 +#include "gtest/gtest.h"
 +#include "propeller/call_return_dedupper.h"
++#include "propeller/save_and_jump_dedupper.h"
 +#include "propeller/tail_call_dedupper.h"
 +
 +namespace propeller {
@@ -5299,6 +6119,181 @@ index 0000000..45cdf3e
 +  input.AddInstruction({0xff, 0xd0}, 2, false, "*");
 +  EXPECT_EQ(FormatSubsequenceBody(input, 0, 4), "4889df..ffd0");
 +  EXPECT_EQ(FormatSubsequenceBody(input, 1, 1), ".");
++}
++
++// An instruction whose key is `size` copies of `byte`, that the ranges of
++// `kinds` may hold.
++void AddKinds(SubsequenceInput& input, uint8_t byte, uint8_t size,
++              uint8_t kinds) {
++  input.AddInstruction(std::vector<uint8_t>(size, byte), size, false, "",
++                       kinds);
++}
++
++// `copies` blocks holding the same run of six 4-byte instructions between
++// barriers; `kinds_of(b)` gives the kinds of block `b`'s copy.
++template <typename KindsOf>
++SubsequenceInput SixInstructionRuns(int copies, KindsOf kinds_of) {
++  SubsequenceInput input;
++  for (int b = 0; b < copies; ++b) {
++    input.AddBlock("m.cpp", "f" + std::to_string(b), 1, 0x1000 * (b + 1), 0);
++    AddBarrier(input);
++    for (uint8_t k = 0x31; k < 0x37; ++k) AddKinds(input, k, 4, kinds_of(b));
++    AddBarrier(input);
++  }
++  return input;
++}
++
++TEST(FindRepeatedRunsTest, SaveAndJumpRunsPayForTheirStubAndReturn) {
++  // Only Save-and-Jump may hold the run (it reads a stack slot, say).
++  const SubsequenceResult result = FindRepeatedRuns(
++      SixInstructionRuns(3, [](int) { return kRunSaveAndJump; }));
++  ASSERT_EQ(result.groups.size(), 1u);
++  EXPECT_EQ(result.groups[0].kind, kRunSaveAndJump);
++  // 3 * (24 - 12) - (24 + 3)
++  EXPECT_EQ(result.groups[0].benefit, 9);
++  EXPECT_EQ(result.sj_groups, 1u);
++  EXPECT_EQ(result.sj_copies, 3u);
++  EXPECT_EQ(result.sj_bytes_saved, 9);
++  // Two copies do not pay for it: 2 * (24 - 12) - (24 + 3) < 0.
++  EXPECT_TRUE(FindRepeatedRuns(SixInstructionRuns(2, [](int) {
++                return kRunSaveAndJump;
++              })).groups.empty());
++}
++
++TEST(FindRepeatedRunsTest, CallReturnWhenBothKindsFit) {
++  const SubsequenceResult result =
++      FindRepeatedRuns(SixInstructionRuns(3, [](int) {
++        return kRunCallReturn | kRunSaveAndJump;
++      }));
++  ASSERT_EQ(result.groups.size(), 1u);
++  EXPECT_EQ(result.groups[0].kind, kRunCallReturn);
++  // 3 * (24 - 5) - (24 + 1)
++  EXPECT_EQ(result.groups[0].benefit, 32);
++  EXPECT_EQ(result.sj_groups, 0u);
++}
++
++TEST(FindRepeatedRunsTest, TheKindThatSavesMoreForItsCopies) {
++  // Copies 0 and 1 may be either kind; copies 2 and 3 only Save-and-Jump (a
++  // red-zone function, say). Call-Return: 2 * (24 - 5) - 25 = 13;
++  // Save-and-Jump: 4 * (24 - 12) - 27 = 21.
++  const SubsequenceResult result =
++      FindRepeatedRuns(SixInstructionRuns(4, [](int b) {
++        return b < 2 ? kRunCallReturn | kRunSaveAndJump : kRunSaveAndJump;
++      }));
++  ASSERT_EQ(result.groups.size(), 1u);
++  EXPECT_EQ(result.groups[0].kind, kRunSaveAndJump);
++  EXPECT_EQ(result.groups[0].benefit, 21);
++  EXPECT_EQ(result.groups[0].starts.size(), 4u);
++}
++
++TEST(SubsequenceDirectivesTest, SaveAndJumpRanges) {
++  const SubsequenceInput input =
++      SixInstructionRuns(3, [](int) { return kRunSaveAndJump; });
++  const SubsequenceResult result = FindRepeatedRuns(input);
++  std::vector<uint64_t> stubs;
++  int master_modules = 0;
++  SaveAndJumpDedupResult formatted;
++  formatted.directives =
++      MakeSubsequenceDirectives(input, result, 7, stubs, master_modules);
++  EXPECT_EQ(stubs, (std::vector<uint64_t>{0x1000, 0x2000, 0x3000}));
++  EXPECT_EQ(FormatSaveAndJumpDirectives(formatted),
++            "m m.cpp\n"
++            "f f0\n"
++            "bbmsj 1 (DeduBB.master.sj.7) insts=6 at=1 block_insts=8 "
++            "body=313131313232323233333333343434343535353536363636\n"
++            "f f1\n"
++            "bbfsj 1 (DeduBB.master.sj.7) insts=6 at=1 block_insts=8\n"
++            "f f2\n"
++            "bbfsj 1 (DeduBB.master.sj.7) insts=6 at=1 block_insts=8\n");
++}
++
++// The blocks of the tail-call suffix tests: each starts with an instruction of
++// its own, `tail` before its ending.
++SubsequenceInput EndingsInput() {
++  SubsequenceInput input;
++  const std::vector<uint8_t> jmp_g = {0xe9, 0, 0, 0, 0, 0, 0x90, 0, 0, 0, 0, 0};
++  const auto add_block = [&](const std::string& f, uint64_t address,
++                             uint8_t own, bool with_p, bool barrier) {
++    input.AddBlock("m.cpp", f, 2, address, 0);
++    AddKinds(input, own, 4, kRunCallReturn);
++    if (barrier) AddBarrier(input);
++    if (with_p) AddKinds(input, 0x50, 4, kRunCallReturn);  // P
++    AddKinds(input, 0x51, 4, kRunCallReturn);              // Q
++    input.AddInstruction(jmp_g, 5, true, "g", kRunCallReturn);  // jmp g
++  };
++  add_block("a", 0x1000, 0xa0, /*with_p=*/true, /*barrier=*/false);
++  add_block("b", 0x2000, 0xb0, /*with_p=*/true, /*barrier=*/false);
++  add_block("c", 0x3000, 0xc0, /*with_p=*/false, /*barrier=*/false);
++  add_block("d", 0x4000, 0xd0, /*with_p=*/false, /*barrier=*/true);
++  return input;
++}
++
++TEST(FindTailCallSuffixesTest, LongestEndingSharedWithAMaster) {
++  const SubsequenceInput input = EndingsInput();
++  const TailCallSuffixResult result = FindTailCallSuffixes(input);
++  // a and b share "P Q jmp g" (13 bytes); c and d share "Q jmp g" (9 bytes)
++  // with them. a, the first by address, keeps its code for both: b folds 13
++  // bytes into it, c and d 9 bytes each.
++  EXPECT_EQ(result.blocks, 4u);
++  EXPECT_EQ(result.masters, 1u);
++  EXPECT_EQ(result.folds, 3u);
++  EXPECT_EQ(result.whole_blocks, 0u);
++  // (13 - 5) + 2 * (9 - 5)
++  EXPECT_EQ(result.bytes_saved, 16);
++  ASSERT_EQ(result.groups.size(), 2u);
++
++  TailCallDedupResult formatted;
++  formatted.directives = MakeTailCallSuffixDirectives(input, result, 3);
++  EXPECT_EQ(FormatDirectives(formatted),
++            "m m.cpp\n"
++            "f a\n"
++            "bbm 2 (DeduBB.master.3) callees=g at=1 block_insts=4\n"
++            "bbm 2 (DeduBB.master.4) callees=g at=2 block_insts=4\n"
++            "f b\n"
++            "bbf 2 (DeduBB.master.3) callees=g at=1 block_insts=4\n"
++            "f c\n"
++            "bbf 2 (DeduBB.master.4) callees=g at=1 block_insts=3\n"
++            "f d\n"
++            "bbf 2 (DeduBB.master.4) callees=g at=2 block_insts=4\n");
++}
++
++TEST(FindTailCallSuffixesTest, WholeBlocksAndTheJumpTheyCost) {
++  SubsequenceInput input;
++  for (int b = 0; b < 3; ++b) {
++    input.AddBlock("m.cpp", "f" + std::to_string(b), 1, 0x1000 * (b + 1), 0);
++    AddKinds(input, 0x61, 3, kRunCallReturn);
++    AddKinds(input, 0x62, 3, kRunCallReturn);
++    AddKinds(input, 0xc3, 3, kRunCallReturn);
++  }
++  // A 4-byte ending would not pay for the 5-byte jump.
++  input.AddBlock("m.cpp", "g0", 1, 0x8000, 0);
++  AddKinds(input, 0x71, 2, kRunCallReturn);
++  AddKinds(input, 0x72, 2, kRunCallReturn);
++  input.AddBlock("m.cpp", "g1", 1, 0x9000, 0);
++  AddKinds(input, 0x71, 2, kRunCallReturn);
++  AddKinds(input, 0x72, 2, kRunCallReturn);
++  const TailCallSuffixResult result = FindTailCallSuffixes(input);
++  ASSERT_EQ(result.groups.size(), 1u);
++  EXPECT_EQ(result.groups[0].master, 0u);
++  EXPECT_EQ(result.groups[0].length, 3u);
++  EXPECT_EQ(result.groups[0].folds, (std::vector<uint32_t>{1, 2}));
++  EXPECT_EQ(result.whole_blocks, 2u);
++  // 2 * (9 - 5)
++  EXPECT_EQ(result.bytes_saved, 8);
++}
++
++TEST(FindTailCallSuffixesTest, HotterBlocksAreMasters) {
++  SubsequenceInput input;
++  for (int b = 0; b < 3; ++b) {
++    input.AddBlock("m.cpp", "f" + std::to_string(b), 1, 0x1000 * (b + 1),
++                   b == 2 ? 100 : 0);
++    AddKinds(input, 0x61, 4, kRunCallReturn);
++    AddKinds(input, 0xc3, 4, kRunCallReturn);
++  }
++  const TailCallSuffixResult result = FindTailCallSuffixes(input);
++  ASSERT_EQ(result.groups.size(), 1u);
++  EXPECT_EQ(result.groups[0].master, 2u);
++  EXPECT_EQ(result.groups[0].folds, (std::vector<uint32_t>{0, 1}));
 +}
 +
 +}  // namespace
