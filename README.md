@@ -1,6 +1,7 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:6EE7B7,100:3B82F6&height=200&section=header&text=Chaitanya%20Mamatha%20Ananda&fontSize=48&fontColor=ffffff&fontAlignY=38&desc=Ph.D.%20Candidate%20%7C%20Researcher%20%7C%20Software%20Engineer&descAlignY=58&descSize=16" width="100%" />
+  <h2>DeduBB</h2>
+  <p>Cross-module basic block deduplication (DeduBB) integrated into LLVM CodeGen and Propeller.</p>
 
 </div>
 
