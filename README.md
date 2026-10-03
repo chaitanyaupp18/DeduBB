@@ -1,8 +1,5 @@
 <div align="center">
-
-  <h2>DeduBB</h2>
-  <p>Cross-module basic block deduplication (DeduBB) integrated into LLVM CodeGen and Propeller.</p>
-
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:6EE7B7,100:3B82F6&height=200&section=header&text=DeduBB&fontSize=48&fontColor=ffffff&fontAlignY=38&desc=Cross-module%20basic%20block%20deduplication%20(DeduBB)%20integrated%20into%20LLVM%20CodeGen%20and%20Propeller.&descAlignY=58&descSize=16" width="100%" />
 </div>
 
 
