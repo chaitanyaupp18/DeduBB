@@ -246,3 +246,30 @@ printf "\n%s\n%s\n%s\n" \
   "disk, as ls -l shows it, of the binary after llvm-strip, as a release ships it." >> ${SIZES}
 
 cat ${SIZES}
+
+# 10. Verify the stripped DeduBB compiler by rebuilding Clang
+VERIFY_DIR="${BASE_DIR}/verify_dedubb"
+VERIFY_COMPILER="${PATH_TO_OPTIMIZED_DEDUBB_BUILD}/bin/clang-${CLANG_VERSION}.stripped"
+
+mkdir -p "${VERIFY_DIR}/symlink_clang"
+ln -sf "${VERIFY_COMPILER}" "${VERIFY_DIR}/symlink_clang/clang"
+ln -sf "${VERIFY_COMPILER}" "${VERIFY_DIR}/symlink_clang/clang++"
+
+cmake -G Ninja \
+  -S "${PATH_TO_LLVM_SOURCES}/llvm-project/llvm" \
+  -B "${VERIFY_DIR}" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_TARGETS_TO_BUILD=X86 \
+  -DLLVM_ENABLE_PROJECTS=clang \
+  -DCMAKE_C_COMPILER="${VERIFY_DIR}/symlink_clang/clang" \
+  -DCMAKE_CXX_COMPILER="${VERIFY_DIR}/symlink_clang/clang++"
+
+ninja -C "${VERIFY_DIR}" clang
+
+if [[ -f "${VERIFY_DIR}/bin/clang-${CLANG_VERSION}" ]]; then
+  ls -l "${VERIFY_DIR}/bin/clang-${CLANG_VERSION}"
+  echo "Clang is successfully verified: the stripped DeduBB compiler rebuilt Clang."
+else
+  echo "Clang verification failed: the expected binary is missing." >&2
+  exit 1
+fi
