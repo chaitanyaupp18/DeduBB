@@ -2,39 +2,135 @@
   <img src="https://capsule-render.vercel.app/api?type=waving&color=0:6EE7B7,100:3B82F6&height=200&section=header&text=DeduBB&fontSize=48&fontColor=ffffff&fontAlignY=38&desc=Cross-module%20basic%20block%20deduplication%20(DeduBB)%20integrated%20into%20LLVM%20CodeGen%20and%20Propeller.&descAlignY=58&descSize=16" width="100%" />
 </div>
 
-
 # DeduBB
 
-DeduBB removes duplicate machine code across a whole program. It finds basic
-blocks, and runs of instructions inside blocks, that are identical anywhere in
-a linked binary, keeps one copy (the master), and turns every other copy into
-a jump or a call to it.
+DeduBB reduces binary code size by deduplicating machine code across functions
+and modules. It finds identical basic blocks and instruction sequences in a
+linked binary, keeps one copy (the master), and replaces the duplicates with
+jumps or calls to that copy.
 
-Paper: [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
+This implementation uses Propeller to identify duplicates and LLVM CodeGen to
+fold them when the program is rebuilt. It supports whole-block and subsequence
+folding.
+
+For details, see [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
 Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
 
 ## How it works
 
-1. **Find.** Propeller's `generate_propeller_profiles` reads a binary built with
-   `-fbasic-block-address-map` and writes a directive file.
-2. **Fold.** The program is built again with the directives, and LLVM's code
-   generator replaces each duplicate.
+1. Build the program with `-fbasic-block-address-map`.
+2. Run Propeller's `generate_propeller_profiles` on the binary to produce a
+   directive file describing the masters and duplicates.
+3. Rebuild the program with the directives. LLVM's code generator replaces
+   each duplicate with a jump or call to its master.
 
-| Fold | Duplicate | Becomes |
+DeduBB uses three folding strategies:
+
+| Strategy | Eligible code | Replacement |
 | --- | --- | --- |
-| Tail call | a block, or its last instructions, ending in a return or a tail call | a `jmp` to the master |
-| Save-and-Jump | a block, or a run of instructions in it, that may use the stack but makes no calls | a `jmp` to the master, which jumps back through `%r11` |
-| Call-Return | a block's body, or a run of instructions in it, that may make calls but leaves the stack alone | a `call` to the master, which returns |
+| Tail Call | A block, or its final instructions, ending in a return or tail call | A `jmp` to the master |
+| Save-and-Jump | A block or instruction sequence that use the stack | A `jmp` to the master, which jumps back through `%r11` |
+| Call-Return | A block's body or instruction sequence that may make calls but leaves the stack alone | A `call` to the master, which returns |
 
-Folding part of a block, its last instructions or a run inside it, is
-*subsequence folding*.
+Subsequence folding applies these strategies to part of a block: its final
+instructions or an instruction sequence within it.
 
-## Directive file
+## Building
 
-From [`examples/seq_test1.cpp`, `examples/seq_test2.cpp`](examples) (`body=`
-shortened):
+The following commands build the X86 target using the revisions required by
+the patches. You will need Git, CMake, Ninja, and a C/C++ build toolchain.
 
+Set `DEDUBB_ROOT` to the absolute path of your DeduBB checkout:
+
+```bash
+export DEDUBB_ROOT=/absolute/path/to/DeduBB
 ```
+
+Build the patched LLVM toolchain:
+
+```bash
+git clone https://github.com/llvm/llvm-project.git
+cd llvm-project
+git checkout 333edde4e
+git apply "$DEDUBB_ROOT/patches/llvm-project-dedubb.patch"
+
+cmake -G Ninja -S llvm -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_TARGETS_TO_BUILD=X86
+ninja -C build clang lld
+
+export PATH="$PWD/build/bin:$PATH"
+cd ..
+```
+
+Build the patched Propeller tool:
+
+```bash
+git clone https://github.com/google/llvm-propeller.git
+cd llvm-propeller
+git checkout e2c7049
+git apply "$DEDUBB_ROOT/patches/llvm-propeller-dedubb.patch"
+
+cmake -G Ninja -B build
+ninja -C build generate_propeller_profiles
+```
+
+The examples below assume that the patched `clang++`, `ld.lld`, and
+`generate_propeller_profiles` executables are on your `PATH`. Alternatively,
+invoke the executables by their full paths.
+
+## Usage
+
+Build a baseline binary:
+
+```bash
+FLAGS="-O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld \
+      -Wl,--lto-basic-block-address-map -Wl,-z,keep-text-section-prefix"
+clang++ $FLAGS a.cpp b.cpp -o app
+```
+
+Generate the deduplication directives:
+
+```bash
+generate_propeller_profiles \
+ --binary=app \
+ --dedubb_profile=dedubb.txt \
+ --dedubb_subsequence
+```
+
+Rebuild with the directives:
+
+```bash
+clang++ $FLAGS -Wl,-mllvm,-dedubb-directives=dedubb.txt \
+ a.cpp b.cpp -o app.dedubb
+```
+
+Both builds must use the same sources, compiler, and flags, apart from the
+DeduBB directives supplied to the second build. Omit `--dedubb_subsequence`
+to fold only whole blocks. With `-Wl,-z,keep-text-section-prefix`, the masters
+are placed in a separate `.text.dedubb` section.
+
+## Optimizing Clang
+
+[`optimize_clang.sh`](optimize_clang.sh) builds Clang at `-Oz` with
+`--gc-sections` and `--icf=all`. It compares the baseline, DeduBB, and LLVM's
+MachineOutliner with one and two rounds. Sizes are written to:
+
+```text
+clang_dedubb_binaries/Results/sizes_clang_dedup.txt
+```
+
+In our experiments, additional MachineOutliner reruns
+(`-machine-outliner-reruns=5`) made Clang larger in both tested modes.
+
+## Directive format
+
+The following example comes from [`examples/seq_test1.cpp`](examples/seq_test1.cpp)
+and [`examples/seq_test2.cpp`](examples/seq_test2.cpp). The `body=` values have
+been shortened.
+
+```text
 m seq_test1.cpp
 f _Z9seq_end_1Pmm
 bbm 0 (DeduBB.master.0) callees=_Z10seq_reportPmm at=2 block_insts=7
@@ -50,53 +146,20 @@ bbmsj 0 (DeduBB.master.sj.4) insts=4 at=29 block_insts=130 body=4c8b442410...
 bbfsj 0 (DeduBB.master.sj.4) insts=4 at=57 block_insts=130
 ```
 
-* `m`, `f`: the source file (informational) and the function of the lines below.
-* `bbm` keeps the master, `bbf` folds into it: tail call (no suffix),
-  Call-Return (`cr`) or Save-and-Jump (`sj`).
-* `0`: the block's ID in the basic-block address map. `(DeduBB.master.K)`: the
-  group; its master and folds share `K`.
-* `at=`, `block_insts=`: subsequence folding, from instruction `at` (counting
-  from 0) of a block of `block_insts` instructions, to the end for a tail call.
-  `insts=`: the number of instructions folded. Without `at=`, the whole block is
-  folded.
-* `callees=`: the functions called or jumped to. `body=`: on the master's line,
-  the master's code in hex.
-
-## Build
-
-```bash
-git clone https://github.com/llvm/llvm-project.git && cd llvm-project
-git checkout 333edde4e && git apply /path/to/DeduBB/patches/llvm-project-dedubb.patch
-cmake -G Ninja -S llvm -B build -DCMAKE_BUILD_TYPE=Release \
-    -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_TARGETS_TO_BUILD=X86
-ninja -C build clang lld && cd ..
-
-git clone https://github.com/google/llvm-propeller.git && cd llvm-propeller
-git checkout e2c7049 && git apply /path/to/DeduBB/patches/llvm-propeller-dedubb.patch
-cmake -G Ninja -B build && ninja -C build generate_propeller_profiles
-```
-
-## Use
-
-```bash
-FLAGS="-O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld \
-       -Wl,--lto-basic-block-address-map -Wl,-z,keep-text-section-prefix"
-clang++ $FLAGS a.cpp b.cpp -o app
-generate_propeller_profiles --binary=app --dedubb_profile=dedubb.txt --dedubb_subsequence
-clang++ $FLAGS -Wl,-mllvm,-dedubb-directives=dedubb.txt a.cpp b.cpp -o app.dedubb
-```
-
-Both builds need the same sources, compiler and flags. Without
-`--dedubb_subsequence`, only whole blocks are folded. With
-`-z keep-text-section-prefix`, the masters get a section of their own,
-`.text.dedubb`.
-
-## Optimizing clang
-
-`optimize_clang.sh` builds clang at `-Oz` with `--gc-sections` and `--icf=all`:
-as the baseline, with DeduBB, and, for comparison, with LLVM's MachineOutliner
-(one and two rounds). It writes the sizes to
-`clang_dedubb_binaries/Results/sizes_clang_dedup.txt`.
+- `m` and `f` identify the source file and function for the records that follow.
+  The source file is informational.
+- `bbm` keeps a master; `bbf` folds a duplicate into it. The suffix selects the
+  strategy: no suffix for Tail Call, `cr` for Call-Return, and `sj` for
+  Save-and-Jump.
+- The number after the record type is the block's ID in the basic-block
+  address map. The parenthesized name identifies the group shared by a master
+  and its folds.
+- `at=` is the subsequence's starting instruction, counted from zero.
+  `block_insts=` is the number of instructions in the original block, and
+  `insts=` is the number of instructions folded. Tail Call folding runs from
+  `at=` to the end of the block. Without `at=`, the whole block is folded.
+- `callees=` lists the functions called or jumped to. On a master's record,
+  `body=` contains the master's machine code in hexadecimal.
 
 ## Citation
 
@@ -115,5 +178,3 @@ as the baseline, with DeduBB, and, for comparison, with LLVM's MachineOutliner
 }
 ```
 
-Rerunning the MachineOutliner (`-machine-outliner-reruns=5`) didn't help: it
-made clang larger in both modes.
