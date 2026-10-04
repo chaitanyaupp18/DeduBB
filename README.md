@@ -4,14 +4,9 @@
 
 # DeduBB
 
-DeduBB reduces binary code size by deduplicating machine code across functions
-and modules. It finds identical basic blocks and instruction sequences in a
-linked binary, keeps one copy (the master), and replaces the duplicates with
-jumps or calls to that copy.
+DeduBB reduces binary code size by deduplicating machine code across functions and modules. It finds identical basic blocks and instruction sequences in a linked binary, keeps one copy (the master), and replaces the duplicates with jumps or calls to that copy.
 
-This implementation uses Propeller to identify duplicates and LLVM CodeGen to
-fold them when the program is rebuilt. It supports whole-block and subsequence
-folding.
+This implementation uses Propeller to identify duplicates and LLVM CodeGen to fold them when the program is rebuilt. It supports whole-block and subsequence folding.
 
 For details, see [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
 Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
@@ -21,7 +16,6 @@ binary, more than LLVM's MachineOutliner with one or two rounds. The savings
 come on top of a baseline already built for size: ThinLTO at `-Oz`, linked
 with `--gc-sections` and `--icf=all`. Every build in the table uses these flags.
 
-| | Code (`.text*`) | Stripped binary |
 | Clang, x86-64 | Code (`.text*`) | Stripped binary |
 | --- | --- | --- |
 | Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 37,975,721 B | 71,377,784 B |
