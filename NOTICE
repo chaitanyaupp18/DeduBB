@@ -1,0 +1,16 @@
+DeduBB
+Copyright 2026 Chaitanya Mamatha Ananda
+
+Original repository:
+https://github.com/chaitanyaupp18/DeduBB
+
+Based on the paper:
+DeduBB: Binary Code Size Reduction via Post-Link Basic Block Deduplication
+
+Chaitanya Mamatha Ananda, Mahbod Afarin, Rajiv Gupta,
+Sriraman Tallam, Han Shen, and Xinliang David Li.
+LCTES 2026.
+https://doi.org/10.1145/3814943.3816169
+
+This repository includes patches to LLVM and Propeller.
+Upstream code retains its original copyright and license notices.
