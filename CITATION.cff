@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use DeduBB in your research, please cite the paper below."
+title: "DeduBB"
+type: software
+authors:
+  - family-names: "Mamatha Ananda"
+    given-names: "Chaitanya"
+repository-code: "https://github.com/chaitanyaupp18/DeduBB"
+preferred-citation:
+  type: conference-paper
+  title: "DeduBB: Binary Code Size Reduction via Post-Link Basic Block Deduplication"
+  authors:
+    - family-names: "Mamatha Ananda"
+      given-names: "Chaitanya"
+    - family-names: "Afarin"
+      given-names: "Mahbod"
+    - family-names: "Gupta"
+      given-names: "Rajiv"
+    - family-names: "Tallam"
+      given-names: "Sriraman"
+    - family-names: "Shen"
+      given-names: "Han"
+    - family-names: "Li"
+      given-names: "Xinliang David"
+  year: 2026
+  doi: "10.1145/3814943.3816169"
