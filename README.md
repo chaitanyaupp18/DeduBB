@@ -111,22 +111,47 @@ DeduBB directives supplied to the second build. Omit `--dedubb_subsequence`
 to fold only whole blocks. With `-Wl,-z,keep-text-section-prefix`, the masters
 are placed in a separate `.text.dedubb` section.
 
+### Cold blocks and code layout
+
+To fold only the blocks a profile shows not to have run, profile the baseline
+(linked with `-Wl,--build-id`, by which the profile is matched to it) and pass
+the profile to `generate_propeller_profiles`, which then also writes
+Propeller's code layout:
+
+```bash
+perf record -e cycles:u -j any,u -- ./app
+generate_propeller_profiles \
+ --binary=app \
+ --profile=perf.data \
+ --dedubb_profile=dedubb.txt \
+ --dedubb_subsequence \
+ --dedubb_cold_only \
+ --cc_profile=cluster.txt \
+ --ld_profile=symorder.txt
+```
+
+To apply the layout too, rebuild with `-fbasic-block-sections=list=cluster.txt`
+in place of `-fbasic-block-address-map`, and with
+`-Wl,--lto-basic-block-sections=cluster.txt -Wl,--symbol-ordering-file=symorder.txt`
+in place of `-Wl,--lto-basic-block-address-map`.
+
 ## Optimizing Clang
 
 [`optimize_clang.sh`](optimize_clang.sh) builds Clang at `-Oz` with
-`--gc-sections` and `--icf=all`. It compares the baseline, DeduBB, and LLVM's
-MachineOutliner with one and two rounds. Sizes are written to:
+`--gc-sections` and `--icf=all`: the baseline, DeduBB on all basic blocks and
+on cold ones (from a profile of 100 compile commands, collected as Propeller
+does), LLVM's MachineOutliner with one and two rounds, Propeller's code layout,
+and both DeduBB builds again with the code layout. Each compiler then builds
+Clang, which times it and verifies it: the Clang it builds must be identical
+to the baseline's. Sizes and timings are written to:
 
 ```text
 clang_dedubb_binaries/Results/sizes_clang_dedup.txt
+clang_dedubb_binaries/Results/perf_clang_dedup.txt
 ```
 
 In our experiments, additional MachineOutliner reruns
 (`-machine-outliner-reruns=5`) made Clang larger in both tested modes.
-
-The [`performance`](https://github.com/chaitanyaupp18/DeduBB/tree/performance)
-branch also folds only cold blocks, from a profile, adds Propeller's code
-layout, and times each compiler building Clang.
 
 ## Directive format
 
