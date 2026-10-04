@@ -18,7 +18,7 @@ with `--gc-sections` and `--icf=all`. Every build in the table uses these flags.
 
 | Clang, x86-64 | Code (`.text*`) | Stripped binary |
 | --- | --- | --- |
-| Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 36.2 MB | 68.1 MB |
+| Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 38.0 MB | 71.4 MB |
 | [MachineOutliner](https://llvm.org/devmtg/2016-11/Slides/Paquette-Outliner.pdf) | −2.60% | +0.85% |
 | [MachineOutliner (two rounds)](https://github.com/llvm/llvm-project/pull/90933) | −7.38% | −2.83% |
 | DeduBB | −9.81% | −6.55% |
