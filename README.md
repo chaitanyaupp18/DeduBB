@@ -11,7 +11,7 @@ This implementation uses Propeller to identify duplicates and LLVM CodeGen to fo
 For details, see [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
 Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
 
-On Clang ([ThinLTO](https://dl.acm.org/doi/pdf/10.5555/3049832.3049845) build), DeduBB removes 9.81% of the machine code and 6.55% of the stripped
+On Clang ([ThinLTO](https://dl.acm.org/doi/10.5555/3049832.3049845) build), DeduBB removes 9.81% of the machine code and 6.55% of the stripped
 binary, more than LLVM's MachineOutliner with one or two rounds. The savings
 come on top of a baseline already built for size: ThinLTO at `-Oz`, linked
 with `--gc-sections` and `--icf=all`. Every build in the table uses these flags.
@@ -133,8 +133,10 @@ MachineOutliner with one and two rounds. Sizes are written to:
 clang_dedubb_binaries/Results/sizes_clang_dedup.txt
 ```
 
-In our experiments, additional MachineOutliner reruns
-(`-machine-outliner-reruns=5`) made Clang larger in both tested modes.
+In our experiments, rerunning the MachineOutliner
+(`-machine-outliner-reruns=5`), the repeated outlining of
+[Chabbi et al.](https://doi.org/10.1109/CGO51591.2021.9370306), made Clang
+larger in both tested modes.
 
 The [`performance`](https://github.com/chaitanyaupp18/DeduBB/tree/performance)
 branch also folds only cold blocks, from a profile, adds Propeller's code
