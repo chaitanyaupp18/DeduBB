@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Copyright 2026 Chaitanya Mamatha Ananda
+# SPDX-License-Identifier: Apache-2.0
+
 # Build and compare Clang with DeduBB and LLVM's MachineOutliner.
 # Run from the DeduBB repository root. Outputs: clang_dedubb_binaries/.
 
