@@ -192,5 +192,17 @@ bbfsj 0 (DeduBB.master.sj.4) insts=4 at=57 block_insts=130
   publisher = {ACM},
   doi       = {10.1145/3814943.3816169}
 }
+
+## License
+
+Original DeduBB contributions are licensed under the
+[Apache License 2.0](LICENSE), except where otherwise noted.
+
+The LLVM patch is provided under
+[Apache License 2.0 with LLVM Exceptions](LICENSE-LLVM).
+The Propeller patch follows Propeller's Apache License 2.0.
+Upstream copyright and license notices are retained.
+
+See [NOTICE](NOTICE) for attribution.
 ```
 
