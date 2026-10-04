@@ -24,7 +24,6 @@ with `--gc-sections` and `--icf=all`. Every build in the table uses these flags.
 | | Code (`.text*`) | Stripped binary |
 | Clang, x86-64 | Code (`.text*`) | Stripped binary |
 | --- | --- | --- |
-
 | Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 37,975,721 B | 71,377,784 B |
 | DeduBB | −9.81% | −6.55% |
 | [MachineOutliner](https://llvm.org/devmtg/2016-11/Slides/Paquette-Outliner.pdf) | −2.60% | +0.85% |
