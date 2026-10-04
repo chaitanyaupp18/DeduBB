@@ -1,8 +1,8 @@
 diff --git a/propeller/BUILD b/propeller/BUILD
-index 1f64add..e0be929 100644
+index 1f64add..e699483 100644
 --- a/propeller/BUILD
 +++ b/propeller/BUILD
-@@ -991,6 +991,117 @@ cc_library(
+@@ -991,6 +991,123 @@ cc_library(
      ],
  )
  
@@ -87,7 +87,10 @@ index 1f64add..e0be929 100644
 +        ":bb_addr_map_cc_proto",
 +        ":binary_content",
 +        ":call_return_dedupper",
++        ":cfg",
++        ":cfg_node",
 +        ":mini_disassembler",
++        ":program_cfg",
 +        ":propeller_options_cc_proto",
 +        ":status_macros",
 +        ":save_and_jump_dedupper",
@@ -112,6 +115,9 @@ index 1f64add..e0be929 100644
 +    srcs = ["tail_call_profile_writer_test.cc"],
 +    deps = [
 +        ":bb_addr_map_cc_proto",
++        ":cfg_edge_kind",
++        ":cfg_testutil",
++        ":program_cfg",
 +        ":tail_call_profile_writer",
 +        "@com_google_googletest//:gtest_main",
 +    ],
@@ -120,7 +126,7 @@ index 1f64add..e0be929 100644
  cc_library(
      name = "profile_generator",
      srcs = ["profile_generator.cc"],
-@@ -1013,6 +1124,7 @@ cc_library(
+@@ -1013,6 +1130,7 @@ cc_library(
          ":propeller_options_cc_proto",
          ":proto_branch_frequencies_aggregator",
          ":status_macros",
@@ -128,7 +134,7 @@ index 1f64add..e0be929 100644
          "@abseil-cpp//absl/algorithm:container",
          "@abseil-cpp//absl/container:flat_hash_set",
          "@abseil-cpp//absl/log",
-@@ -1042,6 +1154,7 @@ cc_binary(
+@@ -1042,6 +1160,7 @@ cc_binary(
      deps = [
          ":profile_generator",
          ":propeller_options_cc_proto",
@@ -183,7 +189,7 @@ index a7a055a..b13eaf9 100644
    DEPS
      # keep-sorted start
 diff --git a/propeller/generate_propeller_profiles.cc b/propeller/generate_propeller_profiles.cc
-index 34c7b30..868c001 100644
+index 34c7b30..e8c1ced 100644
 --- a/propeller/generate_propeller_profiles.cc
 +++ b/propeller/generate_propeller_profiles.cc
 @@ -29,6 +29,13 @@
@@ -213,7 +219,7 @@ index 34c7b30..868c001 100644
  #include "propeller/text_proto_flag.h"
  
  namespace {
-@@ -65,6 +74,51 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
+@@ -65,6 +74,52 @@ ABSL_FLAG(ProfileType, profile_type, ProfileType::kPerfLbr,
            "\"PERF_SPE\", \"FREQUENCIES_PROTO\").");
  ABSL_FLAG(std::string, cc_profile, "", "Output cc profile");
  ABSL_FLAG(std::string, ld_profile, "", "Output ld profile");
@@ -224,8 +230,9 @@ index 34c7b30..868c001 100644
 +          "directives, and Call-Return (`bbmcr`/`bbfcr`) directives with "
 +          "--dedubb_call_return. Does not require a perf profile.");
 +ABSL_FLAG(bool, dedubb_cold_only, false,
-+          "Restrict DeduBB to cold basic blocks (zero post-link frequency) to "
-+          "preserve hot-path performance.");
++          "Restrict DeduBB to cold basic blocks, those the perf profile "
++          "(--profile) shows not to have run, to preserve hot-path "
++          "performance.");
 +ABSL_FLAG(bool, dedubb_intra_module_only, false,
 +          "Restrict DeduBB to blocks within the same module.");
 +ABSL_FLAG(bool, dedubb_skip_aliased_functions, true,
@@ -265,7 +272,7 @@ index 34c7b30..868c001 100644
  ABSL_FLAG(propeller::TextProtoFlag<propeller::PropellerOptions>,
            propeller_options, {},
            "Override for propeller options (debug only).");
-@@ -122,6 +176,34 @@ int main(int argc, char* argv[]) {
+@@ -122,6 +177,34 @@ int main(int argc, char* argv[]) {
    options.set_binary_name(absl::GetFlag(FLAGS_binary));
    options.set_cluster_out_name(absl::GetFlag(FLAGS_cc_profile));
    options.set_symbol_order_out_name(absl::GetFlag(FLAGS_ld_profile));
@@ -300,7 +307,7 @@ index 34c7b30..868c001 100644
  
    for (const std::string& profile : absl::GetFlag(FLAGS_profile)) {
      InputProfile* input_profile = options.add_input_profiles();
-@@ -130,5 +212,14 @@ int main(int argc, char* argv[]) {
+@@ -130,5 +213,14 @@ int main(int argc, char* argv[]) {
          ToProtoProfileType(absl::GetFlag(FLAGS_profile_type)));
    }
  
@@ -383,7 +390,7 @@ index 377f5b9..f0b703c 100644
    explicit MiniDisassembler(const llvm::object::ObjectFile* object_file)
        : object_file_(object_file) {}
 diff --git a/propeller/profile_generator.cc b/propeller/profile_generator.cc
-index 61f6643..89e9ea1 100644
+index 61f6643..d784254 100644
 --- a/propeller/profile_generator.cc
 +++ b/propeller/profile_generator.cc
 @@ -45,6 +45,7 @@
@@ -394,12 +401,13 @@ index 61f6643..89e9ea1 100644
  
  namespace propeller {
  namespace {
-@@ -168,6 +169,9 @@ absl::Status GeneratePropellerProfiles(
+@@ -168,6 +169,10 @@ absl::Status GeneratePropellerProfiles(
    RETURN_IF_ERROR(PropellerProfileWriter(opts).Write(profile));
    LOG(INFO) << profile.stats.DebugString();
  
-+  // Also emit DeduBB tail-call deduplication directives when requested.
-+  RETURN_IF_ERROR(WriteTailCallDedupProfile(opts));
++  // Also emit DeduBB tail-call deduplication directives when requested, with
++  // the block frequencies of the profile.
++  RETURN_IF_ERROR(WriteTailCallDedupProfile(opts, profile.program_cfg.get()));
 +
    return absl::OkStatus();
  }
@@ -1092,10 +1100,10 @@ index 0000000..3265b69
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer.cc b/propeller/tail_call_profile_writer.cc
 new file mode 100644
-index 0000000..8c48ed3
+index 0000000..c818a3a
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer.cc
-@@ -0,0 +1,2340 @@
+@@ -0,0 +1,2402 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1154,7 +1162,10 @@ index 0000000..8c48ed3
 +#include "propeller/bb_addr_map.pb.h"
 +#include "propeller/binary_content.h"
 +#include "propeller/call_return_dedupper.h"
++#include "propeller/cfg.h"
++#include "propeller/cfg_node.h"
 +#include "propeller/mini_disassembler.h"
++#include "propeller/program_cfg.h"
 +#include "propeller/propeller_options.pb.h"
 +#include "propeller/status_macros.h"  // Included for macros.
 +#include "propeller/save_and_jump_dedupper.h"
@@ -1266,6 +1277,36 @@ index 0000000..8c48ed3
 +    functions.erase(kept_end, functions.end());
 +  }
 +  return removed;
++}
++
++int64_t AddProfileFrequencies(const ProgramCfg& program_cfg,
++                              BbAddrMapPb& bb_addr_map) {
++  absl::flat_hash_map<uint64_t, FunctionBbAddrMapPb*> functions;
++  for (ModuleBbAddrMapPb& module : *bb_addr_map.mutable_module_bb_addr_maps())
++    for (FunctionBbAddrMapPb& function :
++         *module.mutable_function_bb_addr_maps())
++      functions.emplace(function.function_address(), &function);
++
++  int64_t ran = 0;
++  for (const ControlFlowGraph* cfg : program_cfg.GetCfgs()) {
++    if (cfg->nodes().empty()) continue;
++    const auto function_it = functions.find(cfg->GetEntryNode()->addr());
++    if (function_it == functions.end()) continue;
++    absl::flat_hash_map<uint32_t, BbEntryPb*> blocks;
++    for (BbRangePb& range : *function_it->second->mutable_bb_ranges())
++      for (BbEntryPb& block : *range.mutable_bb_entries())
++        blocks.emplace(block.id(), &block);
++    cfg->ForEachNodeRef([&](const CFGNode& node) {
++      const int64_t frequency = node.CalculateFrequency();
++      const auto block_it = blocks.find(node.bb_id());
++      if (frequency <= 0 || block_it == blocks.end()) return;
++      BbEntryPb& block = *block_it->second;
++      block.set_post_link_frequency(
++          std::max(block.post_link_frequency(), frequency));
++      ++ran;
++    });
++  }
++  return ran;
 +}
 +
 +int TailCallPatchSize(const BinaryContent& binary_content) {
@@ -2982,7 +3023,8 @@ index 0000000..8c48ed3
 +  return blocks;
 +}
 +
-+absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts) {
++absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts,
++                                       const ProgramCfg* program_cfg) {
 +  if (opts.dedubb_profile_out_name().empty()) return absl::OkStatus();
 +
 +  ASSIGN_OR_RETURN(std::unique_ptr<BinaryContent> binary_content,
@@ -2992,6 +3034,34 @@ index 0000000..8c48ed3
 +  // module names (via DWARF), function names (via the symbol table), and the
 +  // per-block tail-call/return flags we need.
 +  BbAddrMapPb bb_addr_map = GetBbAddrMap(opts.binary_name());
++
++  // Block frequencies pick the hottest copy of a duplicate as its master and,
++  // with `dedubb_cold_only`, leave the blocks that ran alone. They come from
++  // the perf profile, if there is one, and from the binary itself if it was
++  // built with `-pgo-analysis-map`.
++  if (program_cfg != nullptr) {
++    LOG(INFO) << "DeduBB: the profile shows "
++              << AddProfileFrequencies(*program_cfg, bb_addr_map)
++              << " block(s) to have run";
++  }
++  if (opts.dedubb_cold_only()) {
++    int64_t blocks = 0;
++    int64_t hot = 0;
++    for (const ModuleBbAddrMapPb& module : bb_addr_map.module_bb_addr_maps())
++      for (const FunctionBbAddrMapPb& function : module.function_bb_addr_maps())
++        for (const BbRangePb& range : function.bb_ranges())
++          for (const BbEntryPb& block : range.bb_entries()) {
++            ++blocks;
++            hot += block.post_link_frequency() > 0 || block.frequency() > 0;
++          }
++    LOG(INFO) << "DeduBB: cold only, leaving alone the " << hot << " of "
++              << blocks << " block(s) that ran";
++    if (hot == 0) {
++      LOG(WARNING) << "DeduBB: --dedubb_cold_only, but no block has a "
++                      "frequency, so every block counts as cold: pass the "
++                      "perf profile with --profile";
++    }
++  }
 +
 +  // The compiler knows functions by name alone. A function without a symbol
 +  // could have the name of any function a directive names, or of any callee a
@@ -3438,10 +3508,10 @@ index 0000000..8c48ed3
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer.h b/propeller/tail_call_profile_writer.h
 new file mode 100644
-index 0000000..91619ba
+index 0000000..928e02a
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer.h
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,145 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -3472,8 +3542,9 @@ index 0000000..91619ba
 +// `opts.dedubb_profile_out_name()`.
 +//
 +// This is a static analysis of the binary: it does not require a perf profile.
-+// A profile is only consulted when `opts.dedubb_cold_only()` is set, to
-+// restrict folding to cold blocks.
++// Block frequencies, from a perf profile (`--profile`) or embedded in the
++// binary (`-pgo-analysis-map`), pick the hottest copy of a duplicate as its
++// master, and with `opts.dedubb_cold_only()` leave the blocks that ran alone.
 +
 +#include <cstdint>
 +#include <string>
@@ -3485,6 +3556,7 @@ index 0000000..91619ba
 +#include "llvm/Object/ObjectFile.h"
 +#include "propeller/bb_addr_map.pb.h"
 +#include "propeller/binary_content.h"
++#include "propeller/program_cfg.h"
 +#include "propeller/propeller_options.pb.h"
 +#include "propeller/tail_call_dedupper.h"
 +
@@ -3529,6 +3601,13 @@ index 0000000..91619ba
 +int64_t RemoveAmbiguousFunctions(const SymbolNameIndex& names,
 +                                 BbAddrMapPb& bb_addr_map);
 +
++// Raises the `post_link_frequency` of each block in `bb_addr_map` to the
++// frequency `program_cfg`, the CFGs built from a perf profile, gives it.
++// Functions are matched by address, blocks by ID. Returns the number of blocks
++// the profile shows to have run.
++int64_t AddProfileFrequencies(const ProgramCfg& program_cfg,
++                              BbAddrMapPb& bb_addr_map);
++
 +// Why x86-64 tail-call candidates were left out, and how many were kept with
 +// calls or jumps in their key.
 +struct TailCallScanStats {
@@ -3570,7 +3649,10 @@ index 0000000..91619ba
 +// shares are left alone (RemoveAmbiguousFunctions), and if a function has no
 +// symbol at all (the binary's local symbols were discarded), the file is
 +// written with no directives, since any of them could name that function too.
-+absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts);
++// `program_cfg`, if not null, holds the CFGs of the perf profile the binary
++// was profiled with (AddProfileFrequencies).
++absl::Status WriteTailCallDedupProfile(const PropellerOptions& opts,
++                                       const ProgramCfg* program_cfg = nullptr);
 +
 +}  // namespace propeller
 +
@@ -6300,10 +6382,10 @@ index 0000000..c97f593
 +}  // namespace propeller
 diff --git a/propeller/tail_call_profile_writer_test.cc b/propeller/tail_call_profile_writer_test.cc
 new file mode 100644
-index 0000000..fcbf68b
+index 0000000..9c0c8e7
 --- /dev/null
 +++ b/propeller/tail_call_profile_writer_test.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,179 @@
 +// Copyright 2026 The Propeller Authors.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -6327,6 +6409,9 @@ index 0000000..fcbf68b
 +#include "gmock/gmock.h"
 +#include "gtest/gtest.h"
 +#include "propeller/bb_addr_map.pb.h"
++#include "propeller/cfg_edge_kind.h"
++#include "propeller/cfg_testutil.h"
++#include "propeller/program_cfg.h"
 +
 +namespace propeller {
 +namespace {
@@ -6433,6 +6518,49 @@ index 0000000..fcbf68b
 +  EXPECT_EQ(bb_addr_map.module_bb_addr_maps(1).function_bb_addr_maps(0)
 +                .function_address(),
 +            uint64_t{0x80});
++}
++
++std::vector<int64_t> PostLinkFrequencies(const FunctionBbAddrMapPb& function) {
++  std::vector<int64_t> out;
++  for (const BbRangePb& range : function.bb_ranges())
++    for (const BbEntryPb& block : range.bb_entries())
++      out.push_back(block.post_link_frequency());
++  return out;
++}
++
++TEST(AddProfileFrequenciesTest, RaisesTheFrequenciesOfBlocksThatRan) {
++  // In the profile, foo ran from block 0 to block 2 and bar did not run; baz
++  // is not in the map, and qux is not in the profile.
++  ProgramCfg program_cfg(
++      TestCfgBuilder(
++          {.cfg_args = {{".text",
++                         0,
++                         "foo",
++                         {{0x1000, 0, 0x10}, {0x1010, 1, 0x7}, {0x1020, 2, 0xa}},
++                         {{0, 2, 5, CFGEdgeKind::kBranchOrFallthough}}},
++                        {".text", 1, "bar", {{0x2000, 0, 0x20}}, {}},
++                        {".text",
++                         2,
++                         "baz",
++                         {{0x3000, 0, 0x10}, {0x3010, 1, 0x10}},
++                         {{0, 1, 4, CFGEdgeKind::kBranchOrFallthough}}}}})
++          .Build());
++  BbAddrMapPb bb_addr_map;
++  ModuleBbAddrMapPb& module = *bb_addr_map.add_module_bb_addr_maps();
++  FunctionBbAddrMapPb& foo = *AddFunction(module, 0x1000, {"foo"});
++  FunctionBbAddrMapPb& bar = *AddFunction(module, 0x2000, {"bar"});
++  FunctionBbAddrMapPb& qux = *AddFunction(module, 0x4000, {"qux"});
++  for (FunctionBbAddrMapPb* function : {&foo, &bar, &qux}) {
++    BbRangePb& range = *function->add_bb_ranges();
++    for (uint32_t id : {0, 1, 2}) range.add_bb_entries()->set_id(id);
++  }
++  // A higher frequency the binary carries itself is kept.
++  foo.mutable_bb_ranges(0)->mutable_bb_entries(2)->set_post_link_frequency(9);
++
++  EXPECT_EQ(AddProfileFrequencies(program_cfg, bb_addr_map), 2);
++  EXPECT_THAT(PostLinkFrequencies(foo), ElementsAre(5, 0, 9));
++  EXPECT_THAT(PostLinkFrequencies(bar), ElementsAre(0, 0, 0));
++  EXPECT_THAT(PostLinkFrequencies(qux), ElementsAre(0, 0, 0));
 +}
 +
 +}  // namespace

@@ -124,6 +124,10 @@ clang_dedubb_binaries/Results/sizes_clang_dedup.txt
 In our experiments, additional MachineOutliner reruns
 (`-machine-outliner-reruns=5`) made Clang larger in both tested modes.
 
+The [`performance`](https://github.com/chaitanyaupp18/DeduBB/tree/performance)
+branch also folds only cold blocks, from a profile, adds Propeller's code
+layout, and times each compiler building Clang.
+
 ## Directive format
 
 The following example comes from [`examples/seq_test1.cpp`](examples/seq_test1.cpp)
