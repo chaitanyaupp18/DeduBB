@@ -1,56 +1,63 @@
 <div align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:6EE7B7,100:3B82F6&height=200&section=header&text=DeduBB&fontSize=48&fontColor=ffffff&fontAlignY=38&desc=Cross-module%20basic%20block%20deduplication%20(DeduBB)%20integrated%20into%20LLVM%20CodeGen%20and%20Propeller.&descAlignY=58&descSize=16" width="100%" />
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:6EE7B7,100:3B82F6&height=200&section=header&text=DeduBB&fontSize=48&fontColor=ffffff&fontAlignY=38&desc=Cross-module%20basic%20block%20deduplication%20(DeduBB)%20as%20a%20BOLT%20pass.&descAlignY=58&descSize=16" width="100%" />
 </div>
 
 # DeduBB
 
 DeduBB reduces binary code size by deduplicating machine code across functions and modules. It finds identical basic blocks and instruction sequences in a linked binary, keeps one copy (the master), and replaces the duplicates with jumps or calls to that copy.
 
-This implementation uses Propeller to identify duplicates and LLVM CodeGen to fold them when the program is rebuilt. It supports whole-block and subsequence folding.
+This branch implements DeduBB as a [BOLT](https://github.com/llvm/llvm-project/tree/main/bolt) pass, which finds the duplicates in the linked binary and folds them in the same run, without rebuilding the program. The [`main`](https://github.com/chaitanyaupp18/DeduBB) branch uses Propeller to find them and LLVM CodeGen to fold them. It supports whole-block and subsequence folding.
 
 For details, see [DeduBB: Binary Code Size Reduction via Post-Link Basic Block
 Deduplication](https://dl.acm.org/doi/10.1145/3814943.3816169) (LCTES '26).
 
-On Clang ([ThinLTO](https://dl.acm.org/doi/10.5555/3049832.3049845) build), DeduBB removes 9.81% of the machine code and 6.55% of the stripped
-binary, more than LLVM's MachineOutliner with one or two rounds. The savings
-come on top of a baseline already built for size: ThinLTO at `-Oz`, linked
-with `--gc-sections` and `--icf=all`. Every build in the table uses these flags.
+On Clang ([ThinLTO](https://dl.acm.org/doi/10.5555/3049832.3049845) build),
+BOLT with DeduBB removes 9.77% of the machine code, against 0.04% for BOLT
+alone. The savings come on top of a baseline already built for size: ThinLTO
+at `-Oz`, linked with `--gc-sections` and `--icf=all`, and with
+`--emit-relocs` for BOLT. Every build in the table uses these flags.
 
 | Clang, x86-64 | Code (`.text*`) | Stripped binary |
 | --- | --- | --- |
-| Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 38.0 MB | 71.4 MB |
-| [MachineOutliner](https://llvm.org/devmtg/2016-11/Slides/Paquette-Outliner.pdf) | −2.60% | +0.85% |
-| [MachineOutliner (two rounds)](https://github.com/llvm/llvm-project/pull/90933) | −7.38% | −2.83% |
-| DeduBB | −9.81% | −6.55% |
+| Baseline: `-Oz`, `--gc-sections`, `--icf=all` | 37.9 MB | 71.3 MB |
+| [BOLT](https://doi.org/10.1109/CGO.2019.8661201) | −0.04% | +4.09% |
+| BOLT + DeduBB | −9.77% | +5.62% |
 
-Each outlined function gets its own unwind entry, so the outliner's binary
-shrinks less than its code, and grows with one round. DeduBB's masters share
-one entry per module. [Optimizing Clang](#optimizing-clang) shows how to
-reproduce these numbers.
+BOLT rewrites the linked binary in place. The sections after the code keep
+their addresses, so the bytes DeduBB folds away stay in the file, and BOLT
+appends what no longer fits where it was: the jump tables it moves and, with
+DeduBB, the index of unwind entries, which gains one entry for the masters.
+The [`main`](https://github.com/chaitanyaupp18/DeduBB) branch folds while
+linking, so its stripped binary shrinks with its code (−6.55%).
+[Optimizing Clang](#optimizing-clang) shows how to reproduce these numbers.
 
 ## How it works
 
-1. Build the program with `-fbasic-block-address-map`.
-2. Run Propeller's `generate_propeller_profiles` on the binary to produce a
-   directive file describing the masters and duplicates.
-3. Rebuild the program with the directives. LLVM's code generator replaces
-   each duplicate with a jump or call to its master.
+1. Link the program with `-Wl,--emit-relocs`, so that BOLT can rewrite it.
+2. Run `llvm-bolt` with `--dedubb`. The pass finds the duplicates in the
+   binary and replaces each with a jump or call to its master.
 
 DeduBB uses three folding strategies:
 
 | Strategy | Eligible code | Replacement |
 | --- | --- | --- |
 | Tail Call | A block, or its final instructions, ending in a return or tail call | A `jmp` to the master |
-| Save-and-Jump | A block or instruction sequence that use the stack | A `jmp` to the master, which jumps back through `%r11` |
-| Call-Return | A block's body or instruction sequence that may make calls but leaves the stack alone | A `call` to the master, which returns |
+| Save-and-Jump | An instruction sequence that uses the stack | A `jmp` to the master, which jumps back through `%r11` |
+| Call-Return | An instruction sequence that may make calls but leaves the stack alone | A `call` to the master, which returns |
 
 Subsequence folding applies these strategies to part of a block: its final
 instructions or an instruction sequence within it.
 
+The masters are placed in a `.text.dedubb` section. A Call-Return master's
+calls may not take arguments on the stack, so the pass leaves out any call
+that a write to `0(%rsp)`, where a call's first stack argument goes, reaches
+after the call before it. Unlike `main`, this branch does not fold blocks
+together with their branches by Save-and-Jump.
+
 ## Building
 
-The following commands build the X86 target using the revisions required by
-the patches. You will need Git, CMake, Ninja, and a C/C++ build toolchain.
+The following commands build the X86 target using the revision required by
+the patch. You will need Git, CMake, Ninja, and a C/C++ build toolchain.
 
 Set `DEDUBB_ROOT` to the absolute path of your DeduBB checkout:
 
@@ -58,126 +65,78 @@ Set `DEDUBB_ROOT` to the absolute path of your DeduBB checkout:
 export DEDUBB_ROOT=/absolute/path/to/DeduBB
 ```
 
-Build the patched LLVM toolchain:
+Build the patched LLVM toolchain, BOLT included:
 
 ```bash
 git clone https://github.com/llvm/llvm-project.git
 cd llvm-project
 git checkout 333edde4e
-git apply "$DEDUBB_ROOT/patches/llvm-project-dedubb.patch"
+git apply "$DEDUBB_ROOT/patches/llvm-project-bolt-dedubb.patch"
 
 cmake -G Ninja -S llvm -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_ENABLE_PROJECTS="clang;lld;bolt" \
   -DLLVM_TARGETS_TO_BUILD=X86
-ninja -C build clang lld
+ninja -C build clang lld llvm-bolt
 
 export PATH="$PWD/build/bin:$PATH"
 cd ..
 ```
 
-Build the patched Propeller tool:
-
-```bash
-git clone https://github.com/google/llvm-propeller.git
-cd llvm-propeller
-git checkout e2c7049
-git apply "$DEDUBB_ROOT/patches/llvm-propeller-dedubb.patch"
-
-cmake -G Ninja -B build
-ninja -C build generate_propeller_profiles
-```
-
 The examples below assume that the patched `clang++`, `ld.lld`, and
-`generate_propeller_profiles` executables are on your `PATH`. Alternatively,
-invoke the executables by their full paths.
+`llvm-bolt` executables are on your `PATH`. Alternatively, invoke the
+executables by their full paths.
 
 ## Usage
 
-Build a baseline binary:
+Build a baseline binary, keeping its relocations for BOLT:
 
 ```bash
-FLAGS="-O2 -flto=thin -fbasic-block-address-map -fuse-ld=lld \
-      -Wl,--lto-basic-block-address-map -Wl,-z,keep-text-section-prefix"
+FLAGS="-O2 -flto=thin -fuse-ld=lld -Wl,--emit-relocs"
 clang++ $FLAGS a.cpp b.cpp -o app
 ```
 
-Generate the deduplication directives:
+Fold the duplicates, then strip the result:
 
 ```bash
-generate_propeller_profiles \
- --binary=app \
- --dedubb_profile=dedubb.txt \
- --dedubb_subsequence
+llvm-bolt app -o app.dedubb --dedubb
+llvm-strip app.dedubb
 ```
 
-Rebuild with the directives:
+With `--dedubb`, BOLT also defaults to `--use-old-text`, `--use-gnu-stack`,
+and `--align-functions=1`, and aligns the new code as the original `.text`
+was: the new code goes where the original code was, the program header table
+stays in place, and functions get no padding. Options given explicitly take
+precedence. When BOLT must add a segment, `--use-gnu-stack` turns the
+`GNU_STACK` program header into it, so the output no longer marks its stack
+as non-executable.
 
-```bash
-clang++ $FLAGS -Wl,-mllvm,-dedubb-directives=dedubb.txt \
- a.cpp b.cpp -o app.dedubb
-```
-
-Both builds must use the same sources, compiler, and flags, apart from the
-DeduBB directives supplied to the second build. Omit `--dedubb_subsequence`
-to fold only whole blocks. With `-Wl,-z,keep-text-section-prefix`, the masters
-are placed in a separate `.text.dedubb` section.
+| Option | Description |
+| --- | --- |
+| `--dedubb` | Fold repeated machine code |
+| `--dedubb-kinds=tc,cr,sj` | Strategies to use: Tail Call, Call-Return, and Save-and-Jump |
+| `--dedubb-call-return-calls` | Let Call-Return masters make calls (default: on) |
+| `--dedubb-cold-only` | Fold only blocks that the profile (`-data`) shows did not run |
+| `--dedubb-skip-aliased` | Leave alone functions with more than one symbol (default: on) |
+| `--print-dedubb` | Print the functions after the pass |
 
 ## Optimizing Clang
 
 [`optimize_clang.sh`](optimize_clang.sh) builds Clang at `-Oz` with
-`--gc-sections` and `--icf=all`. It compares the baseline, DeduBB, and LLVM's
-MachineOutliner with one and two rounds. Sizes are written to:
+`--gc-sections` and `--icf=all`, then optimizes it with BOLT, without and with
+DeduBB. Sizes are written to:
 
 ```text
 clang_dedubb_binaries/Results/sizes_clang_dedup.txt
 ```
 
-In our experiments, rerunning the MachineOutliner
-(`-machine-outliner-reruns=5`), the repeated outlining of
-[Chabbi et al.](https://doi.org/10.1109/CGO51591.2021.9370306), made Clang
-larger in both tested modes.
-
-The [`performance`](https://github.com/chaitanyaupp18/DeduBB/tree/performance)
-branch also folds only cold blocks, from a profile, adds Propeller's code
-layout, and times each compiler building Clang.
-
-## Directive format
-
-The following example comes from [`examples/seq_test1.cpp`](examples/seq_test1.cpp)
-and [`examples/seq_test2.cpp`](examples/seq_test2.cpp). The `body=` values have
-been shortened.
+Each compiler, stripped, then rebuilds Clang. The script times the builds and
+checks that each compiler builds the same Clang, bit for bit, as the baseline
+compiler:
 
 ```text
-m seq_test1.cpp
-f _Z9seq_end_1Pmm
-bbm 0 (DeduBB.master.0) callees=_Z10seq_reportPmm at=2 block_insts=7
-f _Z9seq_mix_1Pmm
-bbmcr 0 (DeduBB.master.cr.1) callees= insts=14 at=2 block_insts=18 body=4889f048c1e81f...
-m seq_test2.cpp
-f _Z9seq_end_2Pmm
-bbf 0 (DeduBB.master.0) callees=_Z10seq_reportPmm at=1 block_insts=6
-f _Z9seq_mix_2Pmm
-bbfcr 0 (DeduBB.master.cr.1) callees= insts=14 at=2 block_insts=18
-f main
-bbmsj 0 (DeduBB.master.sj.4) insts=4 at=29 block_insts=130 body=4c8b442410...
-bbfsj 0 (DeduBB.master.sj.4) insts=4 at=57 block_insts=130
+clang_dedubb_binaries/Results/perf_clang_dedup.txt
 ```
-
-- `m` and `f` identify the source file and function for the records that follow.
-  The source file is informational.
-- `bbm` keeps a master; `bbf` folds a duplicate into it. The suffix selects the
-  strategy: no suffix for Tail Call, `cr` for Call-Return, and `sj` for
-  Save-and-Jump.
-- The number after the record type is the block's ID in the basic-block
-  address map. The parenthesized name identifies the group shared by a master
-  and its folds.
-- `at=` is the subsequence's starting instruction, counted from zero.
-  `block_insts=` is the number of instructions in the original block, and
-  `insts=` is the number of instructions folded. Tail Call folding runs from
-  `at=` to the end of the block. Without `at=`, the whole block is folded.
-- `callees=` lists the functions called or jumped to. On a master's record,
-  `body=` contains the master's machine code in hexadecimal.
 
 ## Citation
 
@@ -203,7 +162,6 @@ Original DeduBB contributions are licensed under the
 
 The LLVM patch is provided under
 [Apache License 2.0 with LLVM Exceptions](LICENSE-LLVM).
-The Propeller patch follows Propeller's Apache License 2.0.
 Upstream copyright and license notices are retained.
 
 See [NOTICE](NOTICE) for attribution.

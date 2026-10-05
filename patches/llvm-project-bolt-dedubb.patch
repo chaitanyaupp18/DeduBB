@@ -1,0 +1,2260 @@
+diff --git a/bolt/include/bolt/Core/BinaryFunction.h b/bolt/include/bolt/Core/BinaryFunction.h
+index 84fbd5661fd0..eb9100f112e7 100644
+--- a/bolt/include/bolt/Core/BinaryFunction.h
++++ b/bolt/include/bolt/Core/BinaryFunction.h
+@@ -213,6 +213,9 @@ public:
+   /// Mark injected functions
+   bool IsInjected = false;
+ 
++  /// An injected function that gets no unwind info.
++  bool NoUnwindInfo = false;
++
+   using LSDATypeTableTy = SmallVector<uint64_t, 0>;
+ 
+   /// List of DWARF CFI instructions. Original CFI from the binary must be
+@@ -1518,9 +1521,14 @@ public:
+   /// Return true if the function has CFI instructions
+   bool hasCFI() const {
+     return !FrameInstructions.empty() || !CIEFrameInstructions.empty() ||
+-           IsInjected;
++           (IsInjected && !NoUnwindInfo);
+   }
+ 
++  /// Emit no unwind info for this injected function: its code runs in the
++  /// frames of the functions that jump to it, which no rule of its own
++  /// describes.
++  void setNoUnwindInfo() { NoUnwindInfo = true; }
++
+   /// Return unique number associated with the function.
+   uint64_t getFunctionNumber() const { return FunctionNumber; }
+ 
+diff --git a/bolt/include/bolt/Core/MCPlusBuilder.h b/bolt/include/bolt/Core/MCPlusBuilder.h
+index 84b44a9ab548..2a1c31e46d94 100644
+--- a/bolt/include/bolt/Core/MCPlusBuilder.h
++++ b/bolt/include/bolt/Core/MCPlusBuilder.h
+@@ -1990,6 +1990,17 @@ public:
+     llvm_unreachable("not implemented");
+   }
+ 
++  /// Creates an instruction that puts the address of \p Target in \p Reg.
++  virtual void createLoadAddress(MCInst &Inst, const MCSymbol *Target,
++                                 MCPhysReg Reg, MCContext *Ctx) const {
++    llvm_unreachable("not implemented");
++  }
++
++  /// Creates an indirect jump to the address in \p Reg.
++  virtual void createIndirectJump(MCInst &Inst, MCPhysReg Reg) const {
++    llvm_unreachable("not implemented");
++  }
++
+   /// Creates a trap instruction in Inst.
+   virtual void createTrap(MCInst &Inst) const {
+     llvm_unreachable("not implemented");
+diff --git a/bolt/lib/Passes/CMakeLists.txt b/bolt/lib/Passes/CMakeLists.txt
+index ec012f05cc49..deed68300c12 100644
+--- a/bolt/lib/Passes/CMakeLists.txt
++++ b/bolt/lib/Passes/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_llvm_library(LLVMBOLTPasses
+   CMOVConversion.cpp
+   CacheMetrics.cpp
+   DataflowAnalysis.cpp
++  DeduBB.cpp
+   DataflowInfoManager.cpp
+   FrameAnalysis.cpp
+   FrameOptimizer.cpp
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+index 6e3022c491a7..1eb2baf1f3c5 100644
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -12,6 +12,7 @@
+ #include "bolt/Passes/AllocCombiner.h"
+ #include "bolt/Passes/AsmDump.h"
+ #include "bolt/Passes/CMOVConversion.h"
++#include "bolt/Passes/DeduBB.h"
+ #include "bolt/Passes/FixRISCVCallsPass.h"
+ #include "bolt/Passes/FixRelaxationPass.h"
+ #include "bolt/Passes/FrameOptimizer.h"
+@@ -278,6 +279,12 @@ static cl::opt<bool> ThreeWayBranchFlag("three-way-branch",
+                                         cl::ReallyHidden,
+                                         cl::cat(BoltOptCategory));
+ 
++extern cl::opt<bool> DeduBBFlag;
++
++static cl::opt<bool> PrintDeduBB("print-dedubb",
++                                 cl::desc("print functions after DeduBB"),
++                                 cl::Hidden, cl::cat(BoltOptCategory));
++
+ static cl::opt<bool> CMOVConversionFlag("cmov-conversion",
+                                         cl::desc("fold jcc+mov into cmov"),
+                                         cl::ReallyHidden,
+@@ -454,6 +461,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   Manager.registerPass(std::make_unique<IdenticalCodeFolding>(PrintICF),
+                        opts::ICF != IdenticalCodeFolding::ICFLevel::None);
+ 
++  // After whole functions are folded, the code they still repeat.
++  Manager.registerPass(std::make_unique<DeduBB>(PrintDeduBB),
++                       opts::DeduBBFlag);
++
+   Manager.registerPass(std::make_unique<PLTCall>(PrintPLT));
+ 
+   Manager.registerPass(std::make_unique<ThreeWayBranch>(),
+@@ -549,6 +560,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+   // This pass should always run last.*
+   Manager.registerPass(std::make_unique<FinalizeFunctions>(PrintFinalized));
+ 
++  // The CFI of DeduBB's stubs, now that each function's CFI is final.
++  Manager.registerPass(std::make_unique<DeduBBCFI>(NeverPrint),
++                       opts::DeduBBFlag);
++
+   // FrameOptimizer has an implicit dependency on FinalizeFunctions.
+   // FrameOptimizer move values around and needs to update CFIs. To do this, it
+   // must read CFI, interpret it and rewrite it, so CFIs need to be correctly
+diff --git a/bolt/lib/Rewrite/RewriteInstance.cpp b/bolt/lib/Rewrite/RewriteInstance.cpp
+index 9e00d48e0385..d35c4fb6f084 100644
+--- a/bolt/lib/Rewrite/RewriteInstance.cpp
++++ b/bolt/lib/Rewrite/RewriteInstance.cpp
+@@ -79,6 +79,7 @@ extern cl::opt<bool> X86AlignBranchWithin32BBoundaries;
+ namespace opts {
+ 
+ extern cl::list<std::string> HotTextMoveSections;
++extern cl::opt<bool> DeduBBFlag;
+ extern cl::opt<bool> Hugify;
+ extern cl::opt<bool> Instrument;
+ extern cl::opt<uint32_t> InstrumentationSleepTime;
+@@ -784,6 +785,20 @@ Error RewriteInstance::run() {
+ 
+   selectFunctionsToPrint();
+ 
++  // DeduBB makes the code smaller. Unless told otherwise, write the new code
++  // where the original .text was, keep the program header table in place
++  // (which discoverStorage lays out), and align functions no more than the
++  // ABI requires, so that the output holds no code but the original's, less
++  // what DeduBB folds.
++  if (opts::DeduBBFlag) {
++    if (!opts::UseOldText.getNumOccurrences())
++      opts::UseOldText = true;
++    if (!opts::UseGnuStack.getNumOccurrences())
++      opts::UseGnuStack = true;
++    if (!opts::AlignFunctions.getNumOccurrences())
++      opts::AlignFunctions = 1;
++  }
++
+   if (Error E = discoverStorage())
+     return E;
+   if (Error E = readSpecialSections())
+@@ -2441,8 +2456,14 @@ void RewriteInstance::adjustCommandLineOptions() {
+     opts::UseOldText = false;
+   }
+ 
+-  if (!opts::AlignText.getNumOccurrences())
++  if (!opts::AlignText.getNumOccurrences()) {
+     opts::AlignText = BC->PageAlign;
++    // With DeduBB, start the new code where the original .text starts, so
++    // that none of it is left over.
++    if (opts::DeduBBFlag && opts::UseOldText)
++      if (ErrorOr<BinarySection &> Text = BC->getUniqueSectionByName(".text"))
++        opts::AlignText = std::max<uint64_t>(Text->getAlignment(), 1);
++  }
+ 
+   if (opts::AlignText < opts::AlignFunctions)
+     opts::AlignText = (unsigned)opts::AlignFunctions;
+diff --git a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+index 11a297f51453..b359866b0b5e 100644
+--- a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
++++ b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+@@ -2776,6 +2776,17 @@ public:
+     return createDirectCall(Inst, Target, Ctx, /*IsTailCall*/ true);
+   }
+ 
++  void createLoadAddress(MCInst &Inst, const MCSymbol *Target, MCPhysReg Reg,
++                         MCContext *Ctx) const override {
++    createLea(Inst, Target, Reg, Ctx);
++  }
++
++  void createIndirectJump(MCInst &Inst, MCPhysReg Reg) const override {
++    Inst.clear();
++    Inst.setOpcode(X86::JMP64r);
++    Inst.addOperand(MCOperand::createReg(Reg));
++  }
++
+   void createLongTailCall(InstructionListType &Seq, const MCSymbol *Target,
+                           MCContext *Ctx) override {
+     Seq.clear();
+diff --git a/bolt/include/bolt/Passes/DeduBB.h b/bolt/include/bolt/Passes/DeduBB.h
+new file mode 100644
+index 000000000000..a8bf786f18e1
+--- /dev/null
++++ b/bolt/include/bolt/Passes/DeduBB.h
+@@ -0,0 +1,48 @@
++//===- bolt/Passes/DeduBB.h - Basic block deduplication ---------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// DeduBB folds machine code that repeats anywhere in the binary into one copy,
++// the master: tail-call endings shared in place, and runs of instructions
++// moved into Call-Return or Save-and-Jump masters. See DeduBB.cpp.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef BOLT_PASSES_DEDUBB_H
++#define BOLT_PASSES_DEDUBB_H
++
++#include "bolt/Passes/BinaryPasses.h"
++
++namespace llvm {
++namespace bolt {
++
++class DeduBB : public BinaryFunctionPass {
++public:
++  explicit DeduBB(const cl::opt<bool> &PrintPass)
++      : BinaryFunctionPass(PrintPass) {}
++
++  const char *getName() const override { return "dedubb"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++/// Adds the CFI of the Call-Return stubs whose masters make calls, once
++/// FinalizeFunctions has fixed each function's CFI for its final layout.
++class DeduBBCFI : public BinaryFunctionPass {
++public:
++  explicit DeduBBCFI(const cl::opt<bool> &PrintPass)
++      : BinaryFunctionPass(PrintPass) {}
++
++  const char *getName() const override { return "dedubb-cfi"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++} // namespace bolt
++} // namespace llvm
++
++#endif
+diff --git a/bolt/lib/Passes/DeduBB.cpp b/bolt/lib/Passes/DeduBB.cpp
+new file mode 100644
+index 000000000000..d54a35563b90
+--- /dev/null
++++ b/bolt/lib/Passes/DeduBB.cpp
+@@ -0,0 +1,2018 @@
++//===- bolt/Passes/DeduBB.cpp - Basic block deduplication -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// DeduBB in BOLT: the folds of the Propeller + CodeGen implementation (Step 1,
++// llvm-propeller's subsequence_dedupper.cc and tail_call_profile_writer.cc;
++// Step 2, llvm/lib/CodeGen/DeduBBCallReturn.cpp), found and applied in one
++// pass over the linked binary (x86-64, relocation mode):
++//
++//  * Tail-call endings. A block that ends in a return or a tail call keeps
++//    its first instructions and replaces the last ones with a jump into a
++//    master block that ends the same way, at an entry point placed where the
++//    shared ending starts:
++//
++//      fold:   <before>                    master:  <its own>
++//              jmp <ending>                <ending>: <the shared instructions>
++//
++//    The jump keeps the fold's frame, so the ending may restore registers and
++//    pop the frame. It holds no call but a final tail call: nothing unwinds
++//    through it with the rules of the master's function.
++//
++//  * Call-Return runs. Every copy of a run becomes `call <master>`, where the
++//    master, in DeduBB.cr.masters, is the run and then `ret`. The run must not
++//    touch %rsp, %rip or the shadow-stack pointer, and its function must not
++//    keep data in the red zone, where the call writes. A run may make calls:
++//    plain direct calls, and calls through a register or memory. Its copies
++//    then become
++//
++//      push %rax; call <master>; lea 8(%rsp), %rsp
++//
++//    so that the master's calls see the stack aligned as the block's did,
++//    with `.cfi_adjust_cfa_offset` around the call where the CFA is
++//    %rsp-based. None of the calls may take arguments on the stack, which
++//    would be 16 bytes away from where its callee looks for them: CodeGen
++//    checks the frame's MaxCallFrameSize; here a call qualifies if nothing
++//    that may write 0(%rsp), where its first stack argument would be, reaches
++//    it since the call before (findStackArgCalls). None may have a landing
++//    pad either, as no invoke is in a run in CodeGen; a copy's stub takes
++//    over its calls' entry in the call-site table.
++//
++//  * Save-and-Jump runs. Every copy becomes
++//
++//      lea Tail(%rip), %r11; jmp <master>; Tail: <the rest of the block>
++//
++//    where the master, in DeduBB.sj.masters, is the run and then `jmp *%r11`.
++//    It runs in the block's own frame, so the run may read and write the
++//    block's stack slots, but may not move %rsp, call, branch or touch %r11,
++//    which must be dead where the run starts. DeduBB.sj.masters has no unwind
++//    info: no rule of its own describes the frames it runs in.
++//
++// The folds are found as Step 1 finds them. Tail-call endings first: the
++// endings of the blocks that end in a return or a tail call form a trie, read
++// from the end, and every block folds the longest ending it shares with a
++// master block, if that saves bytes. Then the runs, in the rest of every
++// block: the program is one string of tokens, one per instruction, with a
++// barrier for every instruction no master can run (and for every CFI
++// instruction, which a run may not cross); the repeated substrings are the
++// intervals of its suffix and LCP arrays, costed in bytes and taken greedily.
++// Two instructions get the same token if they have the same bytes; a direct
++// tail jump is keyed by the function (and entry) it reaches. An operand BOLT
++// symbolized for any other reason (a %rip-relative or absolute address) makes
++// the instruction one no master can run.
++//
++// Step 1 decides from bytes and Step 2 checks what bytes cannot tell; here
++// Step 2's checks (the frame setup a run must start after, %r11's liveness,
++// landing pads, stack arguments) run before the folds are chosen.
++//
++//===----------------------------------------------------------------------===//
++
++#include "bolt/Passes/DeduBB.h"
++#include "bolt/Core/BinaryBasicBlock.h"
++#include "bolt/Core/BinaryContext.h"
++#include "bolt/Core/BinaryFunction.h"
++#include "bolt/Core/BinarySection.h"
++#include "bolt/Core/MCPlus.h"
++#include "bolt/Core/MCPlusBuilder.h"
++#include "bolt/Utils/NameResolver.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/BinaryFormat/Dwarf.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/MC/MCCodeEmitter.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCDwarf.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCFixup.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrDesc.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Endian.h"
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <numeric>
++#include <queue>
++#include <set>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++#define DEBUG_TYPE "bolt-dedubb"
++
++using namespace llvm;
++using namespace bolt;
++
++namespace opts {
++extern cl::OptionCategory BoltOptCategory;
++
++cl::opt<bool> DeduBBFlag(
++    "dedubb",
++    cl::desc("fold repeated machine code into shared copies (DeduBB): "
++             "tail-call endings, Call-Return and Save-and-Jump runs"),
++    cl::cat(BoltOptCategory));
++
++static cl::opt<std::string>
++    DeduBBKinds("dedubb-kinds",
++                cl::desc("comma-separated kinds of fold: tc (tail-call "
++                         "endings), cr (Call-Return runs), sj (Save-and-Jump "
++                         "runs)"),
++                cl::init("tc,cr,sj"), cl::cat(BoltOptCategory));
++
++static cl::opt<bool> DeduBBCallReturnCalls(
++    "dedubb-call-return-calls",
++    cl::desc("let Call-Return masters make calls (each stub then pushes 8 "
++             "bytes around its call, with CFI where the CFA is %rsp-based)"),
++    cl::init(true), cl::cat(BoltOptCategory));
++
++static cl::opt<bool> DeduBBColdOnly(
++    "dedubb-cold-only",
++    cl::desc("fold only in blocks the profile shows not to have run"),
++    cl::cat(BoltOptCategory));
++
++static cl::opt<bool> DeduBBSkipAliased(
++    "dedubb-skip-aliased",
++    cl::desc("leave alone functions with more than one name, as Step 1 does"),
++    cl::init(true), cl::cat(BoltOptCategory));
++} // namespace opts
++
++namespace {
++
++//===----------------------------------------------------------------------===//
++// The finders, as in Step 1 (subsequence_dedupper.cc).
++//===----------------------------------------------------------------------===//
++
++struct KeyHash {
++  size_t operator()(std::string_view Key) const {
++    uint64_t Hash = 0xcbf29ce484222325ULL; // FNV-1a
++    for (char C : Key) {
++      Hash ^= static_cast<uint8_t>(C);
++      Hash *= 0x100000001b3ULL;
++    }
++    return static_cast<size_t>(Hash);
++  }
++};
++
++// Marks the `push` and `lea` of a Call-Return stub whose master makes calls,
++// with how much each moves the CFA, until DeduBBCFI turns it into CFI.
++constexpr const char *CFAAdjustAnnotation = "DeduBBCFAAdjust";
++
++// Which kinds of range may hold an instruction.
++enum RunKind : uint8_t {
++  RunCallReturn = 1,
++  RunSaveAndJump = 2,
++};
++
++// The program's instructions, block after block (Step 1's SubsequenceInput).
++struct Input {
++  struct Block {
++    uint64_t Address = 0;
++    uint64_t Frequency = 0;
++    bool LLVMSuffix = false; // The function's name has a ThinLTO ".llvm.".
++    uint32_t FirstInst = 0;
++    uint32_t NumInsts = 0;
++  };
++
++  void addBlock(uint64_t Address, uint64_t Frequency, bool LLVMSuffix) {
++    Blocks.push_back({Address, Frequency, LLVMSuffix,
++                      static_cast<uint32_t>(Sizes.size()), 0});
++  }
++
++  // `Kinds` is 0, and `Key` empty, for an instruction no fold may hold.
++  void addInstruction(std::string_view Key, unsigned Size, uint8_t Kinds,
++                      bool Call) {
++    if (Key.empty())
++      Kinds = 0;
++    if (Kinds)
++      KeyBytes.append(Key);
++    KeyBegin.push_back(KeyBytes.size());
++    Sizes.push_back(static_cast<uint8_t>(std::min(Size, 255u)));
++    KindBits.push_back(Kinds);
++    Calls.push_back(Call);
++    ++Blocks.back().NumInsts;
++  }
++
++  size_t numInstructions() const { return Sizes.size(); }
++  std::string_view key(size_t I) const {
++    return std::string_view(KeyBytes).substr(KeyBegin[I],
++                                             KeyBegin[I + 1] - KeyBegin[I]);
++  }
++
++  std::vector<Block> Blocks;
++  std::vector<uint64_t> KeyBegin{0};
++  std::string KeyBytes;
++  std::vector<uint8_t> Sizes;
++  std::vector<uint8_t> KindBits;
++  std::vector<bool> Calls;
++};
++
++// The order blocks are preferred in as masters: the hottest first, then one
++// whose function has no ThinLTO ".llvm." suffix, then the lowest address.
++bool blockLess(const Input::Block &X, const Input::Block &Y) {
++  if (X.Frequency != Y.Frequency)
++    return X.Frequency > Y.Frequency;
++  if (X.LLVMSuffix != Y.LLVMSuffix)
++    return !X.LLVMSuffix;
++  return X.Address < Y.Address;
++}
++
++constexpr uint32_t Barrier = std::numeric_limits<uint32_t>::max();
++
++std::vector<int32_t> buildSuffixArray(const std::vector<int32_t> &Text,
++                                      int32_t Alphabet) {
++  const int32_t N = static_cast<int32_t>(Text.size());
++  std::vector<int32_t> SA(N), Rank(N), Tmp(N);
++  if (N == 0)
++    return SA;
++  // Prefix doubling, two stable counting sorts per round.
++  {
++    std::vector<int32_t> Count(static_cast<size_t>(Alphabet) + 1, 0);
++    for (int32_t C : Text)
++      ++Count[C + 1];
++    for (size_t C = 1; C < Count.size(); ++C)
++      Count[C] += Count[C - 1];
++    for (int32_t I = 0; I < N; ++I)
++      SA[Count[Text[I]]++] = I;
++  }
++  int32_t Classes = 1;
++  Rank[SA[0]] = 0;
++  for (int32_t J = 1; J < N; ++J) {
++    if (Text[SA[J]] != Text[SA[J - 1]])
++      ++Classes;
++    Rank[SA[J]] = Classes - 1;
++  }
++  std::vector<int32_t> Count(static_cast<size_t>(N) + 1);
++  for (int64_t K = 1; Classes < N; K <<= 1) {
++    int32_t P = 0;
++    for (int64_t I = std::max<int64_t>(0, N - K); I < N; ++I)
++      Tmp[P++] = static_cast<int32_t>(I);
++    for (int32_t J = 0; J < N; ++J)
++      if (SA[J] >= K)
++        Tmp[P++] = static_cast<int32_t>(SA[J] - K);
++    std::fill(Count.begin(), Count.begin() + Classes + 1, 0);
++    for (int32_t I = 0; I < N; ++I)
++      ++Count[Rank[I] + 1];
++    for (int32_t C = 1; C <= Classes; ++C)
++      Count[C] += Count[C - 1];
++    for (int32_t J = 0; J < N; ++J)
++      SA[Count[Rank[Tmp[J]]]++] = Tmp[J];
++    int32_t NextClasses = 1;
++    Tmp[SA[0]] = 0;
++    for (int32_t J = 1; J < N; ++J) {
++      const int32_t A = SA[J - 1], B = SA[J];
++      const int32_t A2 = A + K < N ? Rank[A + K] : -1;
++      const int32_t B2 = B + K < N ? Rank[B + K] : -1;
++      if (Rank[A] != Rank[B] || A2 != B2)
++        ++NextClasses;
++      Tmp[B] = NextClasses - 1;
++    }
++    Rank.swap(Tmp);
++    Classes = NextClasses;
++  }
++  return SA;
++}
++
++std::vector<int32_t> buildLcpArray(const std::vector<int32_t> &Text,
++                                   const std::vector<int32_t> &SA) {
++  // Kasai et al.
++  const int32_t N = static_cast<int32_t>(Text.size());
++  std::vector<int32_t> Rank(N), Lcp(N, 0);
++  for (int32_t I = 0; I < N; ++I)
++    Rank[SA[I]] = I;
++  int32_t H = 0;
++  for (int32_t I = 0; I < N; ++I) {
++    if (Rank[I] == 0) {
++      H = 0;
++      continue;
++    }
++    const int32_t J = SA[Rank[I] - 1];
++    while (I + H < N && J + H < N && Text[I + H] == Text[J + H])
++      ++H;
++    Lcp[Rank[I]] = H;
++    if (H > 0)
++      --H;
++  }
++  return Lcp;
++}
++
++struct RunOptions {
++  int StubSize = 5;           // call rel32
++  int StubSizeWithCalls = 11; // push %rax; call rel32; lea 8(%rsp),%rsp
++  int MasterOverhead = 1;     // ret
++  int SJStubSize = 12;        // lea 1f(%rip),%r11; jmp rel32
++  int SJMasterOverhead = 3;   // jmp *%r11
++  int MinOccurrences = 2;
++};
++
++struct RunResult {
++  struct Group {
++    uint32_t Length = 0;
++    uint32_t Bytes = 0;
++    bool WithCalls = false;
++    RunKind Kind = RunCallReturn;
++    int64_t Benefit = 0;
++    std::vector<uint32_t> Starts; // Each copy's first instruction, ascending.
++  };
++  std::vector<Group> Groups;
++  uint64_t Runnable = 0, Candidates = 0, Copies = 0, SJCopies = 0;
++  int64_t BytesSaved = 0, SJBytesSaved = 0;
++};
++
++// Step 1's FindRepeatedRuns.
++RunResult findRepeatedRuns(const Input &In, const RunOptions &Options) {
++  RunResult Result;
++  const size_t NumInsts = In.numInstructions();
++
++  std::unordered_map<std::string_view, int32_t, KeyHash> Ids;
++  std::vector<int32_t> Token(NumInsts, -1);
++  std::vector<uint32_t> Occurrences;
++  for (size_t I = 0; I < NumInsts; ++I) {
++    if (In.KindBits[I] == 0)
++      continue;
++    ++Result.Runnable;
++    const auto [It, Inserted] =
++        Ids.try_emplace(In.key(I), static_cast<int32_t>(Occurrences.size()));
++    if (Inserted)
++      Occurrences.push_back(0);
++    Token[I] = It->second;
++    ++Occurrences[It->second];
++  }
++
++  // The tokens that repeat, block after block, with a barrier after each
++  // block and in place of every other instruction.
++  const int32_t NumTokens = static_cast<int32_t>(Occurrences.size());
++  std::vector<int32_t> Text;
++  std::vector<uint32_t> InstAt;
++  Text.reserve(NumInsts + In.Blocks.size());
++  InstAt.reserve(NumInsts + In.Blocks.size());
++  int32_t NextBarrier = NumTokens;
++  bool AfterBarrier = false;
++  uint64_t Repeated = 0;
++  const auto AddBarrier = [&] {
++    if (AfterBarrier)
++      return;
++    Text.push_back(NextBarrier++);
++    InstAt.push_back(Barrier);
++    AfterBarrier = true;
++  };
++  for (const Input::Block &Block : In.Blocks) {
++    for (uint32_t I = Block.FirstInst; I < Block.FirstInst + Block.NumInsts;
++         ++I) {
++      if (Token[I] < 0 || Occurrences[Token[I]] < 2) {
++        AddBarrier();
++        continue;
++      }
++      ++Repeated;
++      Text.push_back(Token[I]);
++      InstAt.push_back(I);
++      AfterBarrier = false;
++    }
++    AddBarrier();
++  }
++  AddBarrier();
++  const int32_t N = static_cast<int32_t>(Text.size());
++  if (Repeated == 0)
++    return Result;
++
++  const std::vector<int32_t> SA = buildSuffixArray(Text, NextBarrier);
++  const std::vector<int32_t> Lcp = buildLcpArray(Text, SA);
++  std::vector<uint64_t> BytesBefore(static_cast<size_t>(N) + 1, 0);
++  std::vector<uint32_t> CallsBefore(static_cast<size_t>(N) + 1, 0);
++  std::vector<uint32_t> NotCRBefore(static_cast<size_t>(N) + 1, 0);
++  std::vector<uint32_t> NotSJBefore(static_cast<size_t>(N) + 1, 0);
++  for (int32_t P = 0; P < N; ++P) {
++    const uint32_t I = InstAt[P];
++    const bool IsInst = I != Barrier;
++    const uint8_t Kinds = IsInst ? In.KindBits[I] : 0;
++    BytesBefore[P + 1] = BytesBefore[P] + (IsInst ? In.Sizes[I] : 0);
++    CallsBefore[P + 1] = CallsBefore[P] + (IsInst && In.Calls[I] ? 1 : 0);
++    NotCRBefore[P + 1] =
++        NotCRBefore[P] + (IsInst && !(Kinds & RunCallReturn) ? 1 : 0);
++    NotSJBefore[P + 1] =
++        NotSJBefore[P] + (IsInst && !(Kinds & RunSaveAndJump) ? 1 : 0);
++  }
++  const auto Benefit = [&](int64_t Copies, int64_t Bytes, bool WithCalls) {
++    const int64_t Stub =
++        WithCalls ? Options.StubSizeWithCalls : Options.StubSize;
++    return Copies * (Bytes - Stub) - (Bytes + Options.MasterOverhead);
++  };
++  const auto SJBenefit = [&](int64_t Copies, int64_t Bytes) {
++    return Copies * (Bytes - Options.SJStubSize) -
++           (Bytes + Options.SJMasterOverhead);
++  };
++
++  // The LCP intervals, bottom-up (Abouelhoda, Kurtz and Ohlebusch), kept if
++  // folding every copy would save bytes.
++  struct Candidate {
++    int32_t LB = 0, RB = 0;
++    uint32_t Length = 0, Bytes = 0;
++    bool WithCalls = false;
++  };
++  std::vector<Candidate> Candidates;
++  struct Open {
++    int32_t Lcp;
++    int32_t LB;
++  };
++  std::vector<Open> Stack = {{0, 0}};
++  for (int32_t I = 1; I <= N; ++I) {
++    const int32_t H = I < N ? Lcp[I] : 0;
++    int32_t LB = I - 1;
++    while (H < Stack.back().Lcp) {
++      const Open Top = Stack.back();
++      Stack.pop_back();
++      const int32_t P = SA[Top.LB];
++      const uint64_t Bytes = BytesBefore[P + Top.Lcp] - BytesBefore[P];
++      const bool WithCalls = CallsBefore[P + Top.Lcp] != CallsBefore[P];
++      const int64_t Copies = I - Top.LB;
++      if (Copies >= Options.MinOccurrences &&
++          Benefit(Copies, static_cast<int64_t>(Bytes), WithCalls) > 0)
++        Candidates.push_back({Top.LB, I - 1, static_cast<uint32_t>(Top.Lcp),
++                              static_cast<uint32_t>(Bytes), WithCalls});
++      LB = Top.LB;
++    }
++    if (H > Stack.back().Lcp)
++      Stack.push_back({H, LB});
++  }
++  Result.Candidates = Candidates.size();
++
++  // The copies a kind of range can still fold, in text order.
++  std::vector<uint8_t> Taken(N, 0);
++  std::vector<int32_t> Starts;
++  const auto Keep = [&](const Candidate &C, RunKind Kind,
++                        std::vector<int32_t> &Kept) {
++    const std::vector<uint32_t> &Banned =
++        Kind == RunCallReturn ? NotCRBefore : NotSJBefore;
++    Starts.assign(SA.begin() + C.LB, SA.begin() + C.RB + 1);
++    std::sort(Starts.begin(), Starts.end());
++    Kept.clear();
++    int64_t FreeFrom = 0;
++    for (int32_t P : Starts) {
++      if (P < FreeFrom)
++        continue;
++      if (Banned[P + C.Length] != Banned[P])
++        continue;
++      bool Clear = true;
++      for (uint32_t K = 0; K < C.Length; ++K) {
++        if (Taken[P + K]) {
++          Clear = false;
++          break;
++        }
++      }
++      if (!Clear)
++        continue;
++      Kept.push_back(P);
++      FreeFrom = static_cast<int64_t>(P) + C.Length;
++    }
++  };
++
++  // Lazy greedy over upper bounds.
++  using Entry = std::pair<int64_t, int32_t>; // saving, -candidate
++  std::priority_queue<Entry> Heap;
++  for (int32_t C = 0; C < static_cast<int32_t>(Candidates.size()); ++C) {
++    const Candidate &Cand = Candidates[C];
++    Heap.push(
++        {Benefit(Cand.RB - Cand.LB + 1, Cand.Bytes, Cand.WithCalls), -C});
++  }
++  constexpr int64_t None = std::numeric_limits<int64_t>::min();
++  std::vector<int32_t> KeptCR, KeptSJ;
++  while (!Heap.empty()) {
++    const auto [Bound, Neg] = Heap.top();
++    Heap.pop();
++    const Candidate &C = Candidates[-Neg];
++    Keep(C, RunCallReturn, KeptCR);
++    int64_t SavingCR = None, SavingSJ = None;
++    if (static_cast<int>(KeptCR.size()) >= Options.MinOccurrences)
++      SavingCR = Benefit(static_cast<int64_t>(KeptCR.size()), C.Bytes,
++                         C.WithCalls);
++    if (!C.WithCalls) {
++      Keep(C, RunSaveAndJump, KeptSJ);
++      if (static_cast<int>(KeptSJ.size()) >= Options.MinOccurrences)
++        SavingSJ = SJBenefit(static_cast<int64_t>(KeptSJ.size()), C.Bytes);
++    }
++    const bool SJ = SavingSJ > SavingCR;
++    const int64_t Saving = SJ ? SavingSJ : SavingCR;
++    const std::vector<int32_t> &Kept = SJ ? KeptSJ : KeptCR;
++    if (Saving <= 0)
++      continue;
++    if (!Heap.empty() && Saving < Heap.top().first) {
++      Heap.push({Saving, Neg});
++      continue;
++    }
++    RunResult::Group Group;
++    Group.Length = C.Length;
++    Group.Bytes = C.Bytes;
++    Group.WithCalls = C.WithCalls;
++    Group.Kind = SJ ? RunSaveAndJump : RunCallReturn;
++    Group.Benefit = Saving;
++    Group.Starts.reserve(Kept.size());
++    for (int32_t P : Kept) {
++      std::fill(Taken.begin() + P, Taken.begin() + P + C.Length, 1);
++      Group.Starts.push_back(InstAt[P]);
++    }
++    Result.Copies += Kept.size();
++    if (SJ) {
++      Result.SJCopies += Kept.size();
++      Result.SJBytesSaved += Saving;
++    }
++    Result.BytesSaved += Saving;
++    Result.Groups.push_back(std::move(Group));
++  }
++  return Result;
++}
++
++struct SuffixResult {
++  struct Group {
++    uint32_t Master = 0; // An index into Input::Blocks.
++    uint32_t Length = 0; // Instructions in the shared ending.
++    uint32_t Bytes = 0;
++    std::vector<uint32_t> Folds;
++    int64_t Benefit = 0;
++  };
++  std::vector<Group> Groups;
++  uint64_t Blocks = 0, Masters = 0, Folds = 0, WholeBlocks = 0;
++  int64_t BytesSaved = 0;
++};
++
++// Step 1's FindTailCallSuffixes.
++SuffixResult findTailCallSuffixes(const Input &In, int PatchSize) {
++  SuffixResult Result;
++  const std::vector<Input::Block> &Blocks = In.Blocks;
++  const uint32_t NumBlocks = static_cast<uint32_t>(Blocks.size());
++
++  std::unordered_map<std::string_view, int32_t, KeyHash> Ids;
++  const auto TokenOf = [&](uint32_t I) {
++    const int32_t Next = static_cast<int32_t>(Ids.size());
++    return Ids.try_emplace(In.key(I), Next).first->second;
++  };
++
++  // The trie of the blocks' endings, read from the end.
++  struct Node {
++    int32_t Parent = -1;
++    uint32_t Depth = 0;
++    uint32_t Bytes = 0;
++    uint32_t Count = 0;
++    int32_t Best = -1;
++    int32_t Master = -1;
++  };
++  std::vector<Node> Nodes(1);
++  std::unordered_map<uint64_t, int32_t> Child;
++  std::vector<uint32_t> PathBegin(NumBlocks + 1, 0);
++  std::vector<int32_t> Path;
++  for (uint32_t B = 0; B < NumBlocks; ++B) {
++    const Input::Block &Block = Blocks[B];
++    PathBegin[B] = static_cast<uint32_t>(Path.size());
++    int32_t NodeIdx = 0;
++    for (uint32_t K = 0; K < Block.NumInsts; ++K) {
++      const uint32_t I = Block.FirstInst + Block.NumInsts - 1 - K;
++      if (In.KindBits[I] == 0)
++        break;
++      const uint64_t Edge = static_cast<uint64_t>(NodeIdx) << 32 |
++                            static_cast<uint32_t>(TokenOf(I));
++      const auto [It, Inserted] =
++          Child.try_emplace(Edge, static_cast<int32_t>(Nodes.size()));
++      if (Inserted) {
++        Node Next;
++        Next.Parent = NodeIdx;
++        Next.Depth = Nodes[NodeIdx].Depth + 1;
++        Next.Bytes = Nodes[NodeIdx].Bytes + In.Sizes[I];
++        Nodes.push_back(Next);
++      }
++      NodeIdx = It->second;
++      Node &Cur = Nodes[NodeIdx];
++      ++Cur.Count;
++      if (Cur.Best < 0 || blockLess(Block, Blocks[Cur.Best]))
++        Cur.Best = static_cast<int32_t>(B);
++      Path.push_back(NodeIdx);
++    }
++    if (Path.size() > PathBegin[B])
++      ++Result.Blocks;
++  }
++  PathBegin[NumBlocks] = static_cast<uint32_t>(Path.size());
++
++  // Masters, deepest shared nodes first.
++  std::vector<int32_t> Order(Nodes.size() - 1);
++  std::iota(Order.begin(), Order.end(), 1);
++  std::stable_sort(Order.begin(), Order.end(), [&](int32_t A, int32_t B) {
++    return Nodes[A].Depth > Nodes[B].Depth;
++  });
++  std::vector<uint8_t> IsMaster(NumBlocks, 0);
++  for (int32_t V : Order) {
++    if (Nodes[V].Count < 2 || Nodes[V].Master >= 0)
++      continue;
++    const int32_t M = Nodes[V].Best;
++    IsMaster[M] = 1;
++    for (int32_t U = V; U > 0 && Nodes[U].Master < 0; U = Nodes[U].Parent)
++      Nodes[U].Master = M;
++  }
++
++  // Every other block folds its deepest served ending, if that saves bytes.
++  std::unordered_map<uint64_t, uint32_t> GroupOf; // (master, length)
++  std::set<int32_t> UsedMasters;
++  for (uint32_t B = 0; B < NumBlocks; ++B) {
++    if (IsMaster[B])
++      continue;
++    for (uint32_t K = PathBegin[B + 1]; K > PathBegin[B]; --K) {
++      const Node &Cur = Nodes[Path[K - 1]];
++      if (Cur.Master < 0)
++        continue;
++      const int64_t Saving = static_cast<int64_t>(Cur.Bytes) - PatchSize;
++      if (Saving > 0) {
++        const auto [It, Inserted] = GroupOf.try_emplace(
++            static_cast<uint64_t>(Cur.Master) << 32 | Cur.Depth,
++            static_cast<uint32_t>(Result.Groups.size()));
++        if (Inserted) {
++          SuffixResult::Group Group;
++          Group.Master = static_cast<uint32_t>(Cur.Master);
++          Group.Length = Cur.Depth;
++          Group.Bytes = Cur.Bytes;
++          Result.Groups.push_back(std::move(Group));
++          UsedMasters.insert(Cur.Master);
++        }
++        SuffixResult::Group &Group = Result.Groups[It->second];
++        Group.Folds.push_back(B);
++        Group.Benefit += Saving;
++        ++Result.Folds;
++        if (Cur.Depth == Blocks[B].NumInsts)
++          ++Result.WholeBlocks;
++        Result.BytesSaved += Saving;
++      }
++      break;
++    }
++  }
++  Result.Masters = UsedMasters.size();
++  return Result;
++}
++
++//===----------------------------------------------------------------------===//
++// Which instructions a fold may hold: Step 1's CallReturnAnalyzer, on the
++// instructions BOLT disassembled.
++//===----------------------------------------------------------------------===//
++
++bool anyNameIn(ArrayRef<StringRef> Names,
++               std::initializer_list<StringRef> Set) {
++  for (StringRef Name : Names)
++    for (StringRef S : Set)
++      if (Name == S)
++        return true;
++  return false;
++}
++
++// Callees that return twice: a call to one from a master would save the
++// master's frame.
++bool isReturnsTwice(ArrayRef<StringRef> Names) {
++  return anyNameIn(Names, {"setjmp", "_setjmp", "__setjmp", "sigsetjmp",
++                           "__sigsetjmp", "savectx", "vfork", "__vfork",
++                           "getcontext", "__getcontext", "qsetjmp"});
++}
++
++// Callees that identify their caller by the return address.
++bool isCallerSensitive(ArrayRef<StringRef> Names) {
++  if (anyNameIn(Names, {"__fentry__", "mcount", "_mcount", "__mcount",
++                        "__cyg_profile_func_enter", "__cyg_profile_func_exit"}))
++    return true;
++  for (StringRef Name : Names)
++    if (Name.starts_with("__sanitizer_cov") || Name.starts_with("__asan_") ||
++        Name.starts_with("__tsan_") || Name.starts_with("__msan_") ||
++        Name.starts_with("__hwasan_"))
++      return true;
++  return false;
++}
++
++// Functions the compiler reaches through pseudo-instructions rather than
++// through a call or jump it can check.
++bool isThunk(ArrayRef<StringRef> Names) {
++  if (anyNameIn(Names, {"__tls_get_addr", "___tls_get_addr"}))
++    return true;
++  for (StringRef Name : Names)
++    if (Name.starts_with("__x86_return_thunk") ||
++        Name.starts_with("__x86_indirect_thunk") ||
++        Name.starts_with("__x86_indirect_call_thunk") ||
++        Name.starts_with("__x86_indirect_jump_thunk") ||
++        Name.starts_with("__llvm_retpoline_") ||
++        Name.starts_with("__llvm_lvi_thunk_"))
++      return true;
++  return false;
++}
++
++// The names of the function `Sym` names (a PLT entry by the symbol it
++// resolves to), or none if it names no function.
++std::vector<StringRef> calleeNames(const BinaryContext &BC, const MCSymbol *Sym,
++                                   const BinaryFunction **Target = nullptr,
++                                   uint64_t *EntryID = nullptr) {
++  std::vector<StringRef> Names;
++  const BinaryFunction *BF =
++      Sym ? BC.getFunctionForSymbol(Sym, EntryID) : nullptr;
++  if (Target)
++    *Target = BF;
++  if (!BF)
++    return Names;
++  for (StringRef Name : BF->getNames()) {
++    Name.consume_back("@PLT");
++    Names.push_back(Name);
++  }
++  return Names;
++}
++
++class Classifier {
++public:
++  explicit Classifier(BinaryContext &BC)
++      : BC(BC), MII(*BC.MII), MRI(*BC.MRI), RIP(findRegister("RIP")),
++        RSP(findRegister("RSP")), RBP(findRegister("RBP")),
++        SSP(findRegister("SSP")), FS(findRegister("FS")),
++        GS(findRegister("GS")), R11(findRegister("R11")),
++        R11D(findRegister("R11D")), RAX(findRegister("RAX")) {}
++
++  bool isValid() const {
++    return RIP.isValid() && RSP.isValid() && RBP.isValid() && FS.isValid() &&
++           GS.isValid() && R11.isValid() && R11D.isValid() && RAX.isValid();
++  }
++
++  MCRegister rax() const { return RAX; }
++
++  // True if the first operand of `Inst` is a symbol, with no offset: the
++  // target of a call or jump that reaches the symbol itself.
++  static bool isPlainSymbol(const MCInst &Inst) {
++    if (MCPlus::getNumPrimeOperands(Inst) == 0 || !Inst.getOperand(0).isExpr())
++      return false;
++    const auto *Ref = dyn_cast<MCSymbolRefExpr>(Inst.getOperand(0).getExpr());
++    return Ref && Ref->getSpecifier() == 0;
++  }
++
++  // The DWARF number of %rsp, as CFI names registers.
++  unsigned rspDwarf() const {
++    return static_cast<unsigned>(MRI.getDwarfRegNum(RSP, /*isEH=*/true));
++  }
++
++  // Step 1's ClassifyInstruction for a call, with Step 2's isMovable: a
++  // Call-Return master may make it if it is a plain direct call to a function
++  // that neither returns twice nor identifies its caller by the return
++  // address, or a call through a register or memory that addresses by
++  // neither %rsp nor %rip. If it may, appends its key to `Key` (a direct call
++  // by the function and entry it reaches, any other by its bytes) and
++  // returns its size; otherwise 0.
++  unsigned classifyCall(const MCInst &Inst, std::string &Key) const {
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    if (!BC.MIB->isCall(Inst) || BC.MIB->isTailCall(Inst))
++      return 0;
++    if (Name == "CALL64pcrel32") {
++      // `call rel32` with no prefix, to the symbol itself.
++      if (Inst.getFlags() != 0 || !isPlainSymbol(Inst))
++        return 0;
++      const BinaryFunction *Target = nullptr;
++      uint64_t EntryID = 0;
++      const std::vector<StringRef> Names =
++          calleeNames(BC, BC.MIB->getTargetSymbol(Inst), &Target, &EntryID);
++      // Thread-local accesses call the resolver from code the linker
++      // rewrites.
++      if (!Target || isReturnsTwice(Names) || isCallerSensitive(Names) ||
++          anyNameIn(Names, {"__tls_get_addr", "___tls_get_addr"}))
++        return 0;
++      const uint64_t Words[3] = {0xe8, reinterpret_cast<uintptr_t>(Target),
++                                 EntryID};
++      Key.append(reinterpret_cast<const char *>(Words), sizeof(Words));
++      return 5;
++    }
++    if (Name != "CALL64r" && Name != "CALL64m" && Name != "CALL64r_NT" &&
++        Name != "CALL64m_NT")
++      return 0;
++    if (operandsOverlap(Inst, RSP) ||
++        (SSP.isValid() && operandsOverlap(Inst, SSP)))
++      return 0;
++    if (operandsOverlap(Inst, RIP) || isAbsolute(Inst) || usesTlsSegment(Inst))
++      return 0;
++    return appendBytes(Key, Inst);
++  }
++
++  // True if `Inst` may write where the first stack argument of a call goes,
++  // at 0(%rsp) when the call is made: a push, a store addressed by %rsp at
++  // no positive displacement (or with an index), a store whose address is
++  // not an operand (string instructions write through %rdi), or a copy of
++  // %rsp. A store above %rsp may be a later stack argument, but never of a
++  // call that does not also get a first one.
++  bool writesStack(const MCInst &Inst) const {
++    if (BC.MIB->isPush(Inst))
++      return true;
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    if (Desc.mayStore()) {
++      const MemoryReference Mem = memoryReference(Inst);
++      if (Mem.K == MemoryReference::None || Mem.K == MemoryReference::Other)
++        return true;
++      if (Mem.K == MemoryReference::BaseIndexDisp && Mem.Base.isValid() &&
++          MRI.regsOverlap(Mem.Base, RSP))
++        return Mem.Index.isValid() || Mem.Disp <= 0;
++    }
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    return MII.getName(Inst.getOpcode()) == "MOV64rr" && N > 1 &&
++           Inst.getOperand(1).isReg() && Inst.getOperand(1).getReg() == RSP;
++  }
++
++  // Appends `Inst`'s bytes to `Key` and returns their number, or returns 0 if
++  // an operand is symbolic: one BOLT fills in when it emits the code.
++  unsigned appendBytes(std::string &Key, const MCInst &Inst) const {
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    for (unsigned I = 0; I < N; ++I) {
++      const MCOperand &Op = Inst.getOperand(I);
++      if (!Op.isReg() && !Op.isImm() && !Op.isSFPImm() && !Op.isDFPImm())
++        return 0;
++    }
++    SmallString<16> Code;
++    SmallVector<MCFixup, 1> Fixups;
++    BC.MCE->encodeInstruction(Inst, Code, Fixups, *BC.STI);
++    if (!Fixups.empty() || Code.empty())
++      return 0;
++    Key.append(Code.begin(), Code.end());
++    return Code.size();
++  }
++
++  // Step 1's IsSaveAndJumpRunnable: a Save-and-Jump master runs `Inst` at
++  // another address but in the block's own frame, between the stub's
++  // `lea 1f(%rip),%r11; jmp` and its own `jmp *%r11`.
++  bool isSaveAndJumpRunnable(const MCInst &Inst) const {
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    if (isSystem(Desc, Name) || isShadowStack(Inst, Desc, Name))
++      return false;
++    if (isControlFlow(Inst, Desc))
++      return false;
++    if (touches(Inst, Desc, R11))
++      return false;
++    if (operandsOverlap(Inst, RIP) || isAbsolute(Inst) || usesTlsSegment(Inst))
++      return false;
++    return !defines(Inst, Desc, RSP);
++  }
++
++  // Step 1's ClassifyInstruction, for an instruction that does not call: a
++  // Call-Return master runs `Inst` at another address, with %rsp 8 lower.
++  bool isCallReturnRunnable(const MCInst &Inst) const {
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    if (isSystem(Desc, Name) || isControlFlow(Inst, Desc))
++      return false;
++    if (isShadowStack(Inst, Desc, Name) || touches(Inst, Desc, RSP))
++      return false;
++    if (operandsOverlap(Inst, RIP) || isAbsolute(Inst))
++      return false;
++    return !usesTlsSegment(Inst);
++  }
++
++  // Step 1's ClassifyTailCallInstruction: whether `Inst` (`Last` if it is the
++  // block's last) can be part of an ending shared in place. If it can, its
++  // key goes to `Key` and its size is returned; otherwise 0.
++  unsigned classifyTailCallInstruction(const MCInst &Inst, bool Last,
++                                       std::string &Key) const {
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    Key.clear();
++    if (Desc.isCall() || isSystem(Desc, Name) ||
++        isShadowStack(Inst, Desc, Name))
++      return 0;
++    if (BC.MIB->isCall(Inst) && !BC.MIB->isTailCall(Inst))
++      return 0;
++    // Padding, and code that hardening passes rewrite.
++    if (Name.starts_with("NOOP") || Name == "LFENCE")
++      return 0;
++    if (operandsOverlap(Inst, RIP) || isAbsolute(Inst) || usesTlsSegment(Inst))
++      return 0;
++    if (!isControlFlow(Inst, Desc))
++      return appendBytes(Key, Inst);
++    if (!Last || BC.MIB->isConditionalBranch(Inst))
++      return 0;
++    if (Name == "RET64" || Name == "RETI64")
++      return appendBytes(Key, Inst);
++    if (Name == "JMP64r" || Name == "JMP64m" || Name == "JMP64r_NT" ||
++        Name == "JMP64m_NT")
++      return BC.MIB->isTailCall(Inst) ? appendBytes(Key, Inst) : 0;
++    if ((Name != "JMP_1" && Name != "JMP_4") || !BC.MIB->isTailCall(Inst) ||
++        !isPlainSymbol(Inst))
++      return 0;
++    // A direct tail jump, keyed by the function and entry it reaches.
++    const BinaryFunction *Target = nullptr;
++    uint64_t EntryID = 0;
++    const std::vector<StringRef> Names =
++        calleeNames(BC, BC.MIB->getTargetSymbol(Inst), &Target, &EntryID);
++    if (!Target || isReturnsTwice(Names) || isCallerSensitive(Names) ||
++        isThunk(Names))
++      return 0;
++    const uint64_t Words[3] = {0xe9, reinterpret_cast<uintptr_t>(Target),
++                               EntryID};
++    Key.append(reinterpret_cast<const char *>(Words), sizeof(Words));
++    return 5; // jmp rel32
++  }
++
++  // True if `Inst` addresses memory through %fs or %gs.
++  bool usesTlsSegment(const MCInst &Inst) const {
++    const MemoryReference Mem = memoryReference(Inst);
++    return Mem.Segment.isValid() && (MRI.regsOverlap(Mem.Segment, FS) ||
++                                     MRI.regsOverlap(Mem.Segment, GS));
++  }
++
++  // True if `Inst` keeps data below %rsp (the red zone): a memory operand, or
++  // an address `lea` computes, at a negative displacement from %rsp.
++  bool usesRedZone(const MCInst &Inst) const { return negativeFrom(Inst, RSP); }
++
++  // True if `Inst` addresses memory at a negative displacement from %rbp,
++  // which in a function that makes no call may be below %rsp too.
++  bool belowFramePointer(const MCInst &Inst) const {
++    return negativeFrom(Inst, RBP);
++  }
++
++  // Part of a prologue: a push, %rsp lowered or aligned, or a frame or base
++  // pointer set from %rsp.
++  bool isFrameSetup(const MCInst &Inst) const {
++    if (BC.MIB->isPush(Inst))
++      return true;
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    const auto RegAt = [&](unsigned I) {
++      return I < N && Inst.getOperand(I).isReg() ? Inst.getOperand(I).getReg()
++                                                 : MCRegister();
++    };
++    if ((Name.starts_with("SUB64ri") || Name.starts_with("AND64ri")) &&
++        RegAt(0) == RSP)
++      return true;
++    if (Name == "MOV64rr" && RegAt(1) == RSP)
++      return true;
++    return Name == "LEA64r" && RegAt(1) == RSP &&
++           (RegAt(0) == RBP || RegAt(0) == RSP);
++  }
++
++  // Whether `Inst` reads %r11, and whether it writes all of it.
++  void r11Effects(const MCInst &Inst, bool &Reads, bool &Kills) const {
++    Reads = Kills = false;
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    for (unsigned I = 0; I < N; ++I) {
++      const MCOperand &Op = Inst.getOperand(I);
++      if (!Op.isReg() || !Op.getReg().isValid() ||
++          !MRI.regsOverlap(Op.getReg(), R11))
++        continue;
++      if (I >= Desc.getNumDefs())
++        Reads = true;
++      else if (Op.getReg() == R11 || Op.getReg() == R11D)
++        Kills = true;
++      else
++        Reads = true; // A partial write keeps the rest.
++    }
++    for (MCPhysReg R : Desc.implicit_uses())
++      if (MRI.regsOverlap(R, R11))
++        Reads = true;
++    for (MCPhysReg R : Desc.implicit_defs())
++      if (MRI.regsOverlap(R, R11))
++        Kills = true;
++  }
++
++private:
++  struct MemoryReference {
++    enum Kind { None, BaseIndexDisp, Offset, Other } K = None;
++    MCRegister Base;
++    MCRegister Index;
++    MCRegister Segment;
++    int64_t Disp = 0;
++  };
++
++  bool isControlFlow(const MCInst &Inst, const MCInstrDesc &Desc) const {
++    return Desc.isCall() || Desc.mayAffectControlFlow(Inst, MRI) ||
++           Desc.isBranch() || Desc.isIndirectBranch() || Desc.isReturn() ||
++           BC.MIB->isCall(Inst) || BC.MIB->isTailCall(Inst) ||
++           BC.MIB->isBranch(Inst) || BC.MIB->isReturn(Inst);
++  }
++
++  bool negativeFrom(const MCInst &Inst, MCRegister Reg) const {
++    const MemoryReference Mem = memoryReference(Inst);
++    return Mem.K == MemoryReference::BaseIndexDisp && Mem.Base.isValid() &&
++           MRI.regsOverlap(Mem.Base, Reg) && Mem.Disp < 0;
++  }
++
++  int memoryOperandStart(const MCInst &Inst) const {
++    const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
++    const StringRef Name = MII.getName(Inst.getOpcode());
++    // `lea`'s address operand is not typed as memory.
++    if (Name.starts_with("LEA16r") || Name.starts_with("LEA32r") ||
++        Name.starts_with("LEA64r") || Name.starts_with("LEA64_32r"))
++      return 1;
++    for (unsigned I = 0; I < Desc.getNumOperands(); ++I)
++      if (Desc.operands()[I].OperandType == MCOI::OPERAND_MEMORY)
++        return static_cast<int>(I);
++    return -1;
++  }
++
++  MemoryReference memoryReference(const MCInst &Inst) const {
++    MemoryReference Mem;
++    const int Start = memoryOperandStart(Inst);
++    if (Start < 0)
++      return Mem;
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    const unsigned S = static_cast<unsigned>(Start);
++    const auto Op = [&](unsigned I) -> const MCOperand & {
++      return Inst.getOperand(I);
++    };
++    if (S + 4 < N && Op(S).isReg() && Op(S + 1).isImm() && Op(S + 2).isReg() &&
++        Op(S + 4).isReg()) {
++      Mem.K = MemoryReference::BaseIndexDisp;
++      Mem.Base = Op(S).getReg();
++      Mem.Index = Op(S + 2).getReg();
++      Mem.Segment = Op(S + 4).getReg();
++      if (Op(S + 3).isImm())
++        Mem.Disp = Op(S + 3).getImm();
++      else
++        Mem.K = MemoryReference::Other;
++      return Mem;
++    }
++    if (S + 1 < N && Op(S).isImm() && Op(S + 1).isReg()) {
++      Mem.K = MemoryReference::Offset;
++      Mem.Disp = Op(S).getImm();
++      Mem.Segment = Op(S + 1).getReg();
++      return Mem;
++    }
++    if (S < N && Op(S).isReg())
++      return Mem; // String instructions address through %rsi/%rdi.
++    Mem.K = MemoryReference::Other;
++    return Mem;
++  }
++
++  bool isAbsolute(const MCInst &Inst) const {
++    const MemoryReference Mem = memoryReference(Inst);
++    switch (Mem.K) {
++    case MemoryReference::None:
++      return false;
++    case MemoryReference::BaseIndexDisp:
++      return !Mem.Base.isValid() && !Mem.Segment.isValid();
++    case MemoryReference::Offset:
++      return !Mem.Segment.isValid();
++    case MemoryReference::Other:
++      return true;
++    }
++    return true;
++  }
++
++  static bool isSystem(const MCInstrDesc &Desc, StringRef Name) {
++    return Desc.isTrap() || Name.starts_with("SYSCALL") ||
++           Name.starts_with("SYSENTER") || Name.starts_with("SYSEXIT") ||
++           Name.starts_with("SYSRET") || Name.starts_with("INT") ||
++           Name.starts_with("UD") || Name == "TRAP" || Name == "HLT" ||
++           Name.starts_with("ENDBR") || Name.starts_with("IRET") ||
++           Name == "VMCALL" || Name == "VMMCALL" || Name == "VMLAUNCH" ||
++           Name == "VMRESUME" || Name.starts_with("VMRUN") ||
++           Name == "VMFUNC" || Name.starts_with("ENCL") || Name == "TDCALL" ||
++           Name.starts_with("SEAM") || Name == "UIRET" ||
++           Name.starts_with("XBEGIN") || Name.starts_with("XABORT") ||
++           Name.starts_with("FAR");
++  }
++
++  bool isShadowStack(const MCInst &Inst, const MCInstrDesc &Desc,
++                     StringRef Name) const {
++    return (SSP.isValid() && touches(Inst, Desc, SSP)) ||
++           Name.starts_with("RDSSP") || Name.starts_with("INCSSP") ||
++           Name.starts_with("SAVEPREVSSP") || Name.starts_with("RSTORSSP") ||
++           Name.starts_with("WRSS") || Name.starts_with("WRUSS") ||
++           Name.starts_with("SETSSBSY") || Name.starts_with("CLRSSBSY");
++  }
++
++  bool defines(const MCInst &Inst, const MCInstrDesc &Desc,
++               MCRegister Reg) const {
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    for (unsigned I = 0; I < Desc.getNumDefs() && I < N; ++I) {
++      const MCOperand &Op = Inst.getOperand(I);
++      if (Op.isReg() && Op.getReg().isValid() &&
++          MRI.regsOverlap(Op.getReg(), Reg))
++        return true;
++    }
++    for (MCPhysReg R : Desc.implicit_defs())
++      if (MRI.regsOverlap(R, Reg))
++        return true;
++    return false;
++  }
++
++  bool operandsOverlap(const MCInst &Inst, MCRegister Reg) const {
++    const unsigned N = MCPlus::getNumPrimeOperands(Inst);
++    for (unsigned I = 0; I < N; ++I) {
++      const MCOperand &Op = Inst.getOperand(I);
++      if (Op.isReg() && Op.getReg().isValid() &&
++          MRI.regsOverlap(Op.getReg(), Reg))
++        return true;
++    }
++    return false;
++  }
++
++  bool touches(const MCInst &Inst, const MCInstrDesc &Desc,
++               MCRegister Reg) const {
++    if (operandsOverlap(Inst, Reg))
++      return true;
++    for (MCPhysReg R : Desc.implicit_uses())
++      if (MRI.regsOverlap(R, Reg))
++        return true;
++    for (MCPhysReg R : Desc.implicit_defs())
++      if (MRI.regsOverlap(R, Reg))
++        return true;
++    return false;
++  }
++
++  MCRegister findRegister(StringRef Name) const {
++    for (unsigned Reg = 1, E = MRI.getNumRegs(); Reg < E; ++Reg)
++      if (Name == MRI.getName(Reg))
++        return MCRegister(Reg);
++    return MCRegister();
++  }
++
++  BinaryContext &BC;
++  const MCInstrInfo &MII;
++  const MCRegisterInfo &MRI;
++  const MCRegister RIP, RSP, RBP, SSP, FS, GS, R11, R11D, RAX;
++};
++
++// True if the binary is marked for indirect branch tracking: its
++// .note.gnu.property sets GNU_PROPERTY_X86_FEATURE_1_IBT. An indirect jump
++// must then land on an `endbr`, which Save-and-Jump's return points lack.
++bool hasIndirectBranchTracking(const BinaryContext &BC) {
++  using support::endian::read32le;
++  ErrorOr<BinarySection &> Section =
++      BC.getUniqueSectionByName(".note.gnu.property");
++  if (!Section)
++    return false;
++  const auto Align8 = [](size_t N) { return (N + 7) & ~size_t{7}; };
++  const StringRef Data = Section->getContents();
++  for (size_t At = 0; At + 12 <= Data.size();) {
++    const uint32_t NameSize = read32le(Data.data() + At);
++    const uint32_t DescSize = read32le(Data.data() + At + 4);
++    const uint32_t Type = read32le(Data.data() + At + 8);
++    const size_t Desc = At + 12 + Align8(NameSize);
++    const size_t Next = Desc + Align8(DescSize);
++    if (Next > Data.size())
++      break;
++    if (Type == ELF::NT_GNU_PROPERTY_TYPE_0 && NameSize == 4 &&
++        Data.substr(At + 12, 4) == StringRef("GNU\0", 4)) {
++      for (size_t P = Desc; P + 8 <= Desc + DescSize;) {
++        const uint32_t PrType = read32le(Data.data() + P);
++        const uint32_t PrSize = read32le(Data.data() + P + 4);
++        if (PrType == ELF::GNU_PROPERTY_X86_FEATURE_1_AND && PrSize >= 4 &&
++            P + 12 <= Desc + DescSize)
++          return read32le(Data.data() + P + 8) &
++                 ELF::GNU_PROPERTY_X86_FEATURE_1_IBT;
++        P += 8 + Align8(PrSize);
++      }
++    }
++    At = Next;
++  }
++  return false;
++}
++
++//===----------------------------------------------------------------------===//
++// The pass.
++//===----------------------------------------------------------------------===//
++
++// An instruction as the folds count them: a prefix (`lock`) goes with the
++// instruction it prefixes, and CFI is not counted.
++struct Insn {
++  MCInst *Inst = nullptr;   // The instruction, not its prefix.
++  MCInst *Prefix = nullptr; // Its prefix, if any.
++  uint32_t Pos = 0;         // The index of its first MCInst in the block.
++  uint8_t Span = 1;         // The MCInsts it takes: 2 with a prefix.
++  bool AfterCFI = false;    // CFI comes right before it.
++};
++
++struct BlockInfo {
++  BinaryFunction *BF = nullptr;
++  BinaryBasicBlock *BB = nullptr;
++  std::vector<Insn> Insns;
++  bool TailCallBlock = false; // Ends in a return or a tail call.
++  uint32_t SetupEnd = 0;      // The Insns before this are frame setup.
++};
++
++struct FunctionInfo {
++  bool RedZone = false;
++  bool ReturnsTwice = false;
++  // The MCInsts before which %r11 is live.
++  DenseMap<const MCInst *, bool> R11LiveBefore;
++  // The calls that may take arguments on the stack.
++  DenseSet<const MCInst *> StackArgCalls;
++  // How the CFA is computed after each prefix of the function's CFI program
++  // (cfaClasses).
++  std::vector<int8_t> CFAClass;
++};
++
++// How a CFA rule computes the CFA.
++enum CFAKind : int8_t {
++  CFAUnknown = -1, // An expression, or a restore without a remember.
++  CFAFromRSP = 0,  // From %rsp, which a push in front of a call moves.
++  CFAFromOther = 1 // From another register, such as the frame pointer.
++};
++
++// The CFA kind after each prefix of `BF`'s CFI program: element I is the kind
++// once the CIE and the first I instructions of the FDE have run. The CFI
++// instructions of a block, in the original layout, are the next ones of the
++// program, so element `getCFIState()` is the kind at a block's start, and
++// element K + 1 the kind after its CFI instruction K.
++std::vector<int8_t> cfaClasses(const BinaryFunction &BF, unsigned RSPDwarf) {
++  int8_t Kind = CFAUnknown;
++  std::vector<int8_t> Remembered;
++  const auto Apply = [&](const MCCFIInstruction &Inst) {
++    switch (Inst.getOperation()) {
++    case MCCFIInstruction::OpDefCfa:
++    case MCCFIInstruction::OpDefCfaRegister:
++    case MCCFIInstruction::OpLLVMDefAspaceCfa:
++      Kind = Inst.getRegister() == RSPDwarf ? CFAFromRSP : CFAFromOther;
++      break;
++    case MCCFIInstruction::OpRememberState:
++      Remembered.push_back(Kind);
++      break;
++    case MCCFIInstruction::OpRestoreState:
++      if (Remembered.empty()) {
++        Kind = CFAUnknown;
++      } else {
++        Kind = Remembered.back();
++        Remembered.pop_back();
++      }
++      break;
++    case MCCFIInstruction::OpEscape:
++      if (!Inst.getValues().empty() &&
++          static_cast<uint8_t>(Inst.getValues()[0]) ==
++              dwarf::DW_CFA_def_cfa_expression)
++        Kind = CFAUnknown;
++      break;
++    default:
++      break;
++    }
++  };
++  for (const MCCFIInstruction &Inst : BF.cie())
++    Apply(Inst);
++  std::vector<int8_t> Kinds;
++  Kinds.reserve(BF.getFDEProgram().size() + 1);
++  Kinds.push_back(Kind);
++  for (const MCCFIInstruction &Inst : BF.getFDEProgram()) {
++    Apply(Inst);
++    Kinds.push_back(Kind);
++  }
++  return Kinds;
++}
++
++// The CFA kind right before MCInst `Pos` of `BB`, in the original layout.
++int8_t cfaKindAt(BinaryContext &BC, const FunctionInfo &FI,
++                 const BinaryBasicBlock &BB, uint32_t Pos) {
++  for (uint32_t P = Pos; P > 0; --P) {
++    const MCInst &Inst = *(BB.begin() + (P - 1));
++    if (!BC.MIB->isCFI(Inst))
++      continue;
++    const size_t Next = static_cast<size_t>(Inst.getOperand(0).getImm()) + 1;
++    return Next < FI.CFAClass.size() ? FI.CFAClass[Next] : CFAUnknown;
++  }
++  const size_t Start = static_cast<size_t>(BB.getCFIState());
++  return Start < FI.CFAClass.size() ? FI.CFAClass[Start] : CFAUnknown;
++}
++
++// The calls of `BF` that may take arguments on the stack: those a path
++// reaches with a write to where a first stack argument goes
++// (Classifier::writesStack) since the last call. An x86-64 SysV caller
++// writes a call's stack arguments after the call before it, as that callee
++// may change its own, and the first of them at 0(%rsp). The frame setup
++// that starts the entry block writes none.
++DenseSet<const MCInst *> findStackArgCalls(BinaryContext &BC,
++                                           const Classifier &C,
++                                           BinaryFunction &BF,
++                                           uint32_t EntrySetupEnd) {
++  const BinaryBasicBlock *Entry = &BF.front();
++  DenseSet<const MCInst *> Calls;
++  // Runs `BB` from `Pending`; returns whether a write is pending at its end.
++  const auto Run = [&](const BinaryBasicBlock &BB, bool Pending,
++                       bool Record) {
++    uint32_t Index = 0; // As collectInsns counts.
++    for (const MCInst &Inst : BB) {
++      if (BC.MIB->isPseudo(Inst))
++        continue;
++      if (BC.MIB->isCall(Inst)) {
++        if (Record && Pending)
++          Calls.insert(&Inst);
++        Pending = false;
++      } else if (C.writesStack(Inst) &&
++                 !(&BB == Entry && Index < EntrySetupEnd)) {
++        Pending = true;
++      }
++      if (!BC.MIB->isPrefix(Inst))
++        ++Index;
++    }
++    return Pending;
++  };
++  DenseMap<const BinaryBasicBlock *, bool> Out;
++  const auto In = [&](const BinaryBasicBlock &BB) {
++    bool Pending = false;
++    for (const BinaryBasicBlock *Pred : BB.predecessors())
++      Pending |= Out.lookup(Pred);
++    return Pending;
++  };
++  for (bool Changed = true; Changed;) {
++    Changed = false;
++    for (const BinaryBasicBlock &BB : BF) {
++      const bool Pending = Run(BB, In(BB), /*Record=*/false);
++      bool &Old = Out[&BB];
++      if (Old != Pending) {
++        Old = Pending;
++        Changed = true;
++      }
++    }
++  }
++  for (const BinaryBasicBlock &BB : BF)
++    Run(BB, In(BB), /*Record=*/true);
++  return Calls;
++}
++
++std::vector<Insn> collectInsns(BinaryContext &BC, BinaryBasicBlock &BB) {
++  std::vector<Insn> Insns;
++  MCInst *Prefix = nullptr;
++  uint32_t PrefixPos = 0;
++  bool AfterCFI = false;
++  for (uint32_t P = 0; P < BB.size(); ++P) {
++    MCInst &Inst = *(BB.begin() + P);
++    if (BC.MIB->isPseudo(Inst)) {
++      AfterCFI = true;
++      continue;
++    }
++    if (BC.MIB->isPrefix(Inst)) {
++      Prefix = &Inst;
++      PrefixPos = P;
++      continue;
++    }
++    Insn I;
++    I.Inst = &Inst;
++    I.Prefix = Prefix;
++    I.Pos = Prefix ? PrefixPos : P;
++    I.Span = static_cast<uint8_t>(P - I.Pos + 1);
++    I.AfterCFI = AfterCFI;
++    Insns.push_back(I);
++    Prefix = nullptr;
++    AfterCFI = false;
++  }
++  return Insns;
++}
++
++// Moves the MCInsts of `BB` from index `Pos` on into a new block placed right
++// after it, which takes over `BB`'s successors; with `Fallthrough`, `BB` falls
++// through to it. Returns the new block.
++BinaryBasicBlock *splitBlockAt(BinaryContext &BC, BinaryFunction &BF,
++                               BinaryBasicBlock *BB, uint32_t Pos,
++                               bool Fallthrough) {
++  std::unique_ptr<BinaryBasicBlock> Owned = BF.createBasicBlock();
++  BinaryBasicBlock *New = Owned.get();
++  for (auto It = BB->begin() + Pos; It != BB->end(); ++It)
++    New->addInstruction(*It);
++  while (BB->size() > Pos) {
++    auto It = BB->begin() + (BB->size() - 1);
++    if (BC.MIB->isPseudo(*It))
++      BB->erasePseudoInstruction(It);
++    else
++      BB->eraseInstruction(It);
++  }
++  BB->moveAllSuccessorsTo(New);
++  if (Fallthrough)
++    BB->addSuccessor(New, BB->getExecutionCount());
++  std::vector<std::unique_ptr<BinaryBasicBlock>> NewBBs;
++  NewBBs.emplace_back(std::move(Owned));
++  BF.insertBasicBlocks(BB, std::move(NewBBs), /*UpdateLayout=*/true,
++                       /*UpdateCFIState=*/true,
++                       /*RecomputeLandingPads=*/true);
++  return New;
++}
++
++// Erases the MCInsts [Begin, End) of `BB`.
++void eraseRange(BinaryContext &BC, BinaryBasicBlock *BB, uint32_t Begin,
++                uint32_t End) {
++  for (uint32_t P = End; P > Begin; --P) {
++    auto It = BB->begin() + (P - 1);
++    if (BC.MIB->isPseudo(*It))
++      BB->erasePseudoInstruction(It);
++    else
++      BB->eraseInstruction(It);
++  }
++}
++
++// The function holding the masters of one kind, with a block, and an entry
++// point, for each. Returns the entry points.
++std::vector<const MCSymbol *>
++createMasters(BinaryContext &BC, StringRef Name, bool UnwindInfo,
++              std::vector<std::vector<MCInst>> &&Bodies) {
++  std::vector<const MCSymbol *> Symbols;
++  if (Bodies.empty())
++    return Symbols;
++  BinaryFunction *BF = BC.createInjectedBinaryFunction(Name.str());
++  // In .text.dedubb, where CodeGen's masters go too, rather than with the
++  // other functions BOLT creates in .text.injected.
++  BF->setCodeSectionName(".text.dedubb");
++  BF->setColdCodeSectionName(".text.dedubb.cold");
++  std::vector<std::unique_ptr<BinaryBasicBlock>> BBs;
++  std::vector<BinaryBasicBlock *> Masters;
++  for (std::vector<MCInst> &Body : Bodies) {
++    BBs.emplace_back(BF->createBasicBlock());
++    Masters.push_back(BBs.back().get());
++    for (MCInst &Inst : Body)
++      BBs.back()->addInstruction(std::move(Inst));
++    BBs.back()->setCFIState(0);
++  }
++  BF->insertBasicBlocks(nullptr, std::move(BBs), /*UpdateLayout=*/true,
++                        /*UpdateCFIState=*/false);
++  BF->updateState(BinaryFunction::State::CFG);
++  for (BinaryBasicBlock *BB : Masters)
++    Symbols.push_back(BF->addEntryPoint(*BB));
++  // No padding in front of them.
++  BF->setAlignment(1);
++  BF->setMaxAlignmentBytes(0);
++  if (!UnwindInfo)
++    BF->setNoUnwindInfo();
++  BF->updateState(BinaryFunction::State::CFG_Finalized);
++  return Symbols;
++}
++
++} // namespace
++
++Error DeduBB::runOnFunctions(BinaryContext &BC) {
++  if (!BC.isX86() || !BC.isELF())
++    return Error::success();
++  if (!BC.HasRelocations) {
++    BC.outs() << "BOLT-WARNING: DeduBB needs relocation mode (link with "
++                 "--emit-relocs); skipped\n";
++    return Error::success();
++  }
++  bool TC = false;
++  uint8_t RunKinds = 0;
++  SmallVector<StringRef, 4> KindNames;
++  StringRef(opts::DeduBBKinds).split(KindNames, ',', -1, false);
++  for (StringRef Kind : KindNames) {
++    if (Kind == "tc")
++      TC = true;
++    else if (Kind == "cr")
++      RunKinds |= RunCallReturn;
++    else if (Kind == "sj")
++      RunKinds |= RunSaveAndJump;
++    else
++      return createFatalBOLTError("BOLT-ERROR: unknown DeduBB kind '" + Kind +
++                                  "'\n");
++  }
++  const Classifier C(BC);
++  if (!C.isValid())
++    return createFatalBOLTError("BOLT-ERROR: DeduBB: registers not found\n");
++  if ((RunKinds & RunSaveAndJump) && hasIndirectBranchTracking(BC)) {
++    BC.outs() << "BOLT-INFO: DeduBB: Save-and-Jump not used, the binary is "
++                 "built for indirect branch tracking\n";
++    RunKinds &= ~RunSaveAndJump;
++  }
++
++  // The functions to fold in, by address.
++  std::vector<BinaryFunction *> Functions;
++  uint64_t Aliased = 0;
++  for (auto &[Address, BF] : BC.getBinaryFunctions()) {
++    if (!shouldOptimize(BF) || !BF.hasCFG() || BF.isPLTFunction() ||
++        BF.isFolded() || BF.isFragment() || BF.isMultiEntry() ||
++        BF.getOneName().starts_with("DeduBB."))
++      continue;
++    // Symbols at its address, not the names BOLT gives local symbols.
++    if (opts::DeduBBSkipAliased) {
++      std::set<StringRef> Symbols;
++      for (StringRef Name : BF.getNames())
++        Symbols.insert(NameResolver::restore(Name));
++      if (Symbols.size() > 1) {
++        ++Aliased;
++        continue;
++      }
++    }
++    Functions.push_back(&BF);
++  }
++
++  // Blocks, their instructions, and the facts about their functions.
++  const auto Cold = [](const BinaryBasicBlock &BB) {
++    return !opts::DeduBBColdOnly || BB.getKnownExecutionCount() == 0;
++  };
++  std::vector<BlockInfo> Blocks;
++  DenseMap<const BinaryFunction *, FunctionInfo> FuncInfo;
++  for (BinaryFunction *BF : Functions) {
++    FunctionInfo &FI = FuncInfo[BF];
++    bool Calls = false, BelowFP = false;
++    const size_t EntryBlock = Blocks.size();
++    for (BinaryBasicBlock &BB : *BF) {
++      BlockInfo Info;
++      Info.BF = BF;
++      Info.BB = &BB;
++      Info.Insns = collectInsns(BC, BB);
++      for (const Insn &I : Info.Insns) {
++        FI.RedZone |= C.usesRedZone(*I.Inst);
++        BelowFP |= C.belowFramePointer(*I.Inst);
++        if (BC.MIB->isCall(*I.Inst) && !BC.MIB->isTailCall(*I.Inst)) {
++          Calls = true;
++          FI.ReturnsTwice |=
++              isReturnsTwice(calleeNames(BC, BC.MIB->getTargetSymbol(*I.Inst)));
++        }
++      }
++      if (!Info.Insns.empty()) {
++        const MCInst &Last = *Info.Insns.back().Inst;
++        Info.TailCallBlock =
++            BB.succ_size() == 0 && !BB.isLandingPad() &&
++            !BC.MIB->isConditionalBranch(Last) &&
++            (BC.MIB->isReturn(Last) || BC.MIB->isTailCall(Last));
++      }
++      // A run starts after the frame setup at the start of the block.
++      while (Info.SetupEnd < Info.Insns.size() &&
++             C.isFrameSetup(*Info.Insns[Info.SetupEnd].Inst))
++        ++Info.SetupEnd;
++      Blocks.push_back(std::move(Info));
++    }
++    // A function that makes no call may keep data below %rsp through a frame
++    // pointer, too.
++    FI.RedZone |= !Calls && BelowFP;
++
++    // For Call-Return runs that make calls: the calls that may take stack
++    // arguments, and where the CFA is computed from %rsp.
++    if ((RunKinds & RunCallReturn) && opts::DeduBBCallReturnCalls && Calls) {
++      FI.StackArgCalls =
++          findStackArgCalls(BC, C, *BF, Blocks[EntryBlock].SetupEnd);
++      if (BF->hasCFI())
++        FI.CFAClass = cfaClasses(*BF, C.rspDwarf());
++    }
++
++    if (!(RunKinds & RunSaveAndJump))
++      continue;
++    // %r11's liveness, as the ABI has it: a call reads it only as its target
++    // and clobbers it, and nothing reads it after a return or a tail call.
++    DenseMap<const BinaryBasicBlock *, bool> LiveIn;
++    const auto Step = [&](const MCInst &Inst, bool LiveAfter) {
++      if (BC.MIB->isPseudo(Inst))
++        return LiveAfter;
++      bool Reads, Kills;
++      C.r11Effects(Inst, Reads, Kills);
++      if (BC.MIB->isCall(Inst) || BC.MIB->isReturn(Inst) ||
++          BC.MIB->isTailCall(Inst))
++        return Reads;
++      return Reads || (LiveAfter && !Kills);
++    };
++    const auto LiveOut = [&](const BinaryBasicBlock &BB) {
++      bool Live = false;
++      for (const BinaryBasicBlock *S : BB.successors())
++        Live |= LiveIn.lookup(S);
++      for (const BinaryBasicBlock *LP : BB.landing_pads())
++        Live |= LiveIn.lookup(LP);
++      return Live;
++    };
++    for (bool Changed = true; Changed;) {
++      Changed = false;
++      for (auto It = BF->rbegin(); It != BF->rend(); ++It) {
++        bool Live = LiveOut(*It);
++        for (auto II = It->rbegin(); II != It->rend(); ++II)
++          Live = Step(*II, Live);
++        bool &In = LiveIn[&*It];
++        if (In != Live) {
++          In = Live;
++          Changed = true;
++        }
++      }
++    }
++    for (BinaryBasicBlock &BB : *BF) {
++      bool Live = LiveOut(BB);
++      for (auto II = BB.rbegin(); II != BB.rend(); ++II) {
++        Live = Step(*II, Live);
++        if (Live)
++          FI.R11LiveBefore[&*II] = true;
++      }
++    }
++  }
++
++  const auto AddInputBlock = [](const BlockInfo &B, Input &In) {
++    In.addBlock(B.BF->getAddress() + B.BB->getInputOffset(),
++                B.BB->getKnownExecutionCount(),
++                B.BF->getOneName().contains(".llvm."));
++  };
++
++  // Tail-call endings: Step 1's BuildTailCallSuffixInput.
++  Input TCIn;
++  std::vector<uint32_t> TCBlockOf; // Input block -> Blocks index.
++  SuffixResult TCResult;
++  if (TC) {
++    std::string Key, Full;
++    for (uint32_t B = 0; B < Blocks.size(); ++B) {
++      const BlockInfo &Info = Blocks[B];
++      if (!Info.TailCallBlock || !Cold(*Info.BB))
++        continue;
++      AddInputBlock(Info, TCIn);
++      TCBlockOf.push_back(B);
++      for (size_t J = 0; J < Info.Insns.size(); ++J) {
++        const Insn &I = Info.Insns[J];
++        Full.clear();
++        unsigned Size = 0;
++        // Possibly made by the linker out of a thread-local access.
++        const bool AfterTls =
++            J > 0 && C.usesTlsSegment(*Info.Insns[J - 1].Inst);
++        if (!AfterTls) {
++          const unsigned PrefixSize = I.Prefix ? C.appendBytes(Full, *I.Prefix)
++                                               : 0;
++          const unsigned InstSize =
++              (!I.Prefix || PrefixSize)
++                  ? C.classifyTailCallInstruction(
++                        *I.Inst, J + 1 == Info.Insns.size(), Key)
++                  : 0;
++          if (InstSize) {
++            Full += Key;
++            Size = PrefixSize + InstSize;
++          }
++        }
++        if (!Size)
++          Full.clear();
++        TCIn.addInstruction(Full, Size, RunCallReturn, false);
++      }
++    }
++    TCResult = findTailCallSuffixes(TCIn, /*PatchSize=*/5);
++  }
++
++  // The first instruction of the ending a tail-call group shares, in a block.
++  const auto EndingStart = [&](uint32_t InputBlock, uint32_t Length) {
++    return TCIn.Blocks[InputBlock].NumInsts - Length;
++  };
++  // The instructions tail-call folds keep: from the start of an ending shared
++  // in place (the longest, for a master of several).
++  DenseMap<const BinaryBasicBlock *, uint32_t> ReservedFrom;
++  for (const SuffixResult::Group &G : TCResult.Groups) {
++    const auto Reserve = [&](uint32_t InputBlock) {
++      const uint32_t At = EndingStart(InputBlock, G.Length);
++      const BinaryBasicBlock *BB = Blocks[TCBlockOf[InputBlock]].BB;
++      const auto [It, Inserted] = ReservedFrom.try_emplace(BB, At);
++      if (!Inserted)
++        It->second = std::min(It->second, At);
++    };
++    Reserve(G.Master);
++    for (uint32_t F : G.Folds)
++      Reserve(F);
++  }
++
++  // Runs: Step 1's BuildSubsequenceInput, with Step 2's checks.
++  Input RunIn;
++  std::vector<uint32_t> RunBlockOf; // Input block -> Blocks index.
++  std::vector<uint32_t> RunInsnOf;  // Input instruction -> its Insn.
++  RunResult Runs;
++  uint64_t SJRunnable = 0;
++  uint64_t CallsMovable = 0, CallsStackArgs = 0, CallsLandingPad = 0,
++           CallsCFAUnknown = 0;
++  if (RunKinds) {
++    std::string Key;
++    for (uint32_t B = 0; B < Blocks.size(); ++B) {
++      const BlockInfo &Info = Blocks[B];
++      const FunctionInfo &FI = FuncInfo[Info.BF];
++      AddInputBlock(Info, RunIn);
++      RunBlockOf.push_back(B);
++      const bool RangeOK = !Info.BB->isLandingPad() && Cold(*Info.BB);
++      const bool CROK = RangeOK && !FI.RedZone && !FI.ReturnsTwice &&
++                        (RunKinds & RunCallReturn);
++      // The block's successors move to the run's return point: none may be
++      // a landing pad.
++      const bool SJOK = RangeOK && Info.BB->landing_pads().empty() &&
++                        (RunKinds & RunSaveAndJump);
++      const auto Reserved = ReservedFrom.find(Info.BB);
++      const uint32_t ReservedAt = Reserved == ReservedFrom.end()
++                                      ? std::numeric_limits<uint32_t>::max()
++                                      : Reserved->second;
++      for (uint32_t J = 0; J < Info.Insns.size(); ++J) {
++        const Insn &I = Info.Insns[J];
++        // CFI between two instructions keeps them apart.
++        if (I.AfterCFI && J > 0) {
++          RunIn.addInstruction("", 0, 0, false);
++          RunInsnOf.push_back(Barrier);
++        }
++        uint8_t Kinds = 0;
++        unsigned Size = 0;
++        bool Call = false;
++        Key.clear();
++        const bool AfterTls =
++            J > 0 && C.usesTlsSegment(*Info.Insns[J - 1].Inst);
++        if (J >= Info.SetupEnd && J < ReservedAt && !AfterTls &&
++            BC.MIB->isCall(*I.Inst)) {
++          // Only a Call-Return master makes calls.
++          if (CROK && opts::DeduBBCallReturnCalls && !I.Prefix &&
++              (Size = C.classifyCall(*I.Inst, Key))) {
++            const std::optional<MCPlus::MCLandingPad> EH =
++                BC.MIB->getEHInfo(*I.Inst);
++            if (FI.StackArgCalls.contains(I.Inst)) {
++              ++CallsStackArgs;
++            } else if (EH && (EH->first || EH->second)) {
++              ++CallsLandingPad;
++            } else if (Info.BF->hasCFI() &&
++                       cfaKindAt(BC, FI, *Info.BB, I.Pos) == CFAUnknown) {
++              ++CallsCFAUnknown;
++            } else {
++              Kinds = RunCallReturn;
++              Call = true;
++              ++CallsMovable;
++            }
++          }
++        } else if (J >= Info.SetupEnd && J < ReservedAt && !AfterTls) {
++          if (CROK && C.isCallReturnRunnable(*I.Inst))
++            Kinds |= RunCallReturn;
++          if (SJOK && C.isSaveAndJumpRunnable(*I.Inst) &&
++              !FI.R11LiveBefore.lookup(&*(Info.BB->begin() + I.Pos))) {
++            Kinds |= RunSaveAndJump;
++            ++SJRunnable;
++          }
++          if (Kinds && I.Prefix && !C.appendBytes(Key, *I.Prefix))
++            Kinds = 0;
++          if (Kinds && !C.appendBytes(Key, *I.Inst))
++            Kinds = 0;
++          Size = Key.size();
++        }
++        if (!Kinds) {
++          Key.clear();
++          Size = 0;
++        }
++        RunIn.addInstruction(Key, Size, Kinds, Call);
++        RunInsnOf.push_back(J);
++      }
++    }
++    Runs = findRepeatedRuns(RunIn, RunOptions());
++  }
++
++  // Each run copy's block and first instruction, the master's first, ordered
++  // as Step 1's MakeSubsequenceDirectives orders them.
++  const auto BlockOfRunInst = [&](uint32_t I) {
++    const auto It = std::upper_bound(
++        RunIn.Blocks.begin(), RunIn.Blocks.end(), I,
++        [](uint32_t V, const Input::Block &B) { return V < B.FirstInst; });
++    return static_cast<uint32_t>(It - RunIn.Blocks.begin()) - 1;
++  };
++  struct Copy {
++    uint32_t InputBlock;
++    uint32_t Start; // An input instruction.
++  };
++  struct RunPlan {
++    const RunResult::Group *G;
++    std::vector<Copy> Copies;
++  };
++  const auto CopyLess = [&](const Copy &A, const Copy &B) {
++    if (A.InputBlock != B.InputBlock)
++      return blockLess(RunIn.Blocks[A.InputBlock], RunIn.Blocks[B.InputBlock]);
++    return A.Start < B.Start;
++  };
++  std::vector<RunPlan> RunPlans;
++  for (const RunResult::Group &G : Runs.Groups) {
++    RunPlan Plan{&G, {}};
++    for (uint32_t S : G.Starts)
++      Plan.Copies.push_back({BlockOfRunInst(S), S});
++    std::sort(Plan.Copies.begin(), Plan.Copies.end(), CopyLess);
++    RunPlans.push_back(std::move(Plan));
++  }
++  std::sort(RunPlans.begin(), RunPlans.end(),
++            [&](const RunPlan &A, const RunPlan &B) {
++              return CopyLess(A.Copies.front(), B.Copies.front());
++            });
++  std::vector<const SuffixResult::Group *> TCPlans;
++  for (const SuffixResult::Group &G : TCResult.Groups)
++    TCPlans.push_back(&G);
++  std::sort(TCPlans.begin(), TCPlans.end(),
++            [&](const SuffixResult::Group *A, const SuffixResult::Group *B) {
++              if (A->Master != B->Master)
++                return blockLess(TCIn.Blocks[A->Master],
++                                 TCIn.Blocks[B->Master]);
++              return A->Length > B->Length;
++            });
++
++  // 1. The run masters, copied from their master copies before any block
++  // changes.
++  std::vector<std::vector<MCInst>> CRBodies, SJBodies;
++  std::vector<size_t> MasterIndex(RunPlans.size());
++  for (size_t K = 0; K < RunPlans.size(); ++K) {
++    const RunPlan &Plan = RunPlans[K];
++    const Copy &Master = Plan.Copies.front();
++    const BlockInfo &Info = Blocks[RunBlockOf[Master.InputBlock]];
++    const bool SJ = Plan.G->Kind == RunSaveAndJump;
++    std::vector<MCInst> Body;
++    for (uint32_t I = Master.Start; I < Master.Start + Plan.G->Length; ++I) {
++      const Insn &In = Info.Insns[RunInsnOf[I]];
++      for (uint32_t P = In.Pos; P < In.Pos + In.Span; ++P) {
++        Body.push_back(*(Info.BB->begin() + P));
++        BC.MIB->stripAnnotations(Body.back());
++      }
++    }
++    Body.emplace_back();
++    if (SJ)
++      BC.MIB->createIndirectJump(Body.back(), BC.MIB->getX86R11());
++    else
++      BC.MIB->createReturn(Body.back());
++    std::vector<std::vector<MCInst>> &Bodies = SJ ? SJBodies : CRBodies;
++    MasterIndex[K] = Bodies.size();
++    Bodies.push_back(std::move(Body));
++  }
++  const size_t NumCRMasters = CRBodies.size(), NumSJMasters = SJBodies.size();
++  const std::vector<const MCSymbol *> CRSymbols = createMasters(
++      BC, "DeduBB.cr.masters", /*UnwindInfo=*/true, std::move(CRBodies));
++  const std::vector<const MCSymbol *> SJSymbols = createMasters(
++      BC, "DeduBB.sj.masters", /*UnwindInfo=*/false, std::move(SJBodies));
++  const auto RunMaster = [&](size_t K) {
++    return RunPlans[K].G->Kind == RunSaveAndJump ? SJSymbols[MasterIndex[K]]
++                                                 : CRSymbols[MasterIndex[K]];
++  };
++
++  // 2. The tail-call masters: an entry point where each shared ending starts,
++  // in a block of its own, the shortest ending first, so that a block that
++  // keeps several is split from its end. Only the entry block keeps its own
++  // entry: the others are new blocks, which no original address refers to.
++  std::vector<const MCSymbol *> TCMasterSym(TCPlans.size());
++  {
++    std::vector<size_t> Order(TCPlans.size());
++    std::iota(Order.begin(), Order.end(), 0);
++    std::stable_sort(Order.begin(), Order.end(), [&](size_t A, size_t B) {
++      return TCPlans[A]->Length < TCPlans[B]->Length;
++    });
++    for (size_t K : Order) {
++      const SuffixResult::Group &G = *TCPlans[K];
++      const BlockInfo &Info = Blocks[TCBlockOf[G.Master]];
++      const uint32_t At = EndingStart(G.Master, G.Length);
++      BinaryBasicBlock *Target = Info.BB;
++      if (At > 0 || Info.BB != &Info.BF->front())
++        Target = splitBlockAt(BC, *Info.BF, Info.BB, Info.Insns[At].Pos,
++                              /*Fallthrough=*/true);
++      TCMasterSym[K] = Info.BF->addEntryPoint(*Target);
++    }
++  }
++
++  // 3. The folds, in each block from the last back, so that every change
++  // leaves the instructions before it where they are.
++  struct Action {
++    uint32_t First, Last; // Insns of the block.
++    enum Kind { TCFold, CR, SJ } K;
++    size_t Plan;
++  };
++  DenseMap<const BinaryBasicBlock *, std::vector<Action>> Actions;
++  for (size_t K = 0; K < TCPlans.size(); ++K) {
++    const SuffixResult::Group &G = *TCPlans[K];
++    for (uint32_t F : G.Folds) {
++      const BlockInfo &Info = Blocks[TCBlockOf[F]];
++      Actions[Info.BB].push_back(
++          {EndingStart(F, G.Length),
++           static_cast<uint32_t>(Info.Insns.size()) - 1, Action::TCFold, K});
++    }
++  }
++  for (size_t K = 0; K < RunPlans.size(); ++K) {
++    const RunPlan &Plan = RunPlans[K];
++    for (const Copy &Cp : Plan.Copies) {
++      const BlockInfo &Info = Blocks[RunBlockOf[Cp.InputBlock]];
++      Actions[Info.BB].push_back(
++          {RunInsnOf[Cp.Start], RunInsnOf[Cp.Start + Plan.G->Length - 1],
++           Plan.G->Kind == RunSaveAndJump ? Action::SJ : Action::CR, K});
++    }
++  }
++  uint64_t TCFolds = 0, CRFolds = 0, CRCallFolds = 0, SJFolds = 0;
++  uint64_t CFIStubs = 0;
++  DenseMap<BinaryFunction *, bool> Changed;
++  for (const BlockInfo &Info : Blocks) {
++    const auto It = Actions.find(Info.BB);
++    if (It == Actions.end())
++      continue;
++    std::vector<Action> &Acts = It->second;
++    std::sort(Acts.begin(), Acts.end(), [](const Action &A, const Action &B) {
++      return A.First > B.First;
++    });
++    BinaryFunction &BF = *Info.BF;
++    BinaryBasicBlock *BB = Info.BB;
++    Changed[&BF] = true;
++    for (const Action &A : Acts) {
++      const uint32_t Begin = Info.Insns[A.First].Pos;
++      const uint32_t End = Info.Insns[A.Last].Pos + Info.Insns[A.Last].Span;
++      if (A.K == Action::TCFold) {
++        // The ending's CFI stays, after the jump, so that the block ends in
++        // the state it ended in.
++        std::vector<MCInst> CFIs;
++        for (auto II = BB->begin() + Begin; II != BB->end(); ++II)
++          if (BC.MIB->isPseudo(*II))
++            CFIs.push_back(*II);
++        eraseRange(BC, BB, Begin, BB->size());
++        MCInst Jump;
++        BC.MIB->createTailCall(Jump, TCMasterSym[A.Plan], BC.Ctx.get());
++        BB->addInstruction(std::move(Jump));
++        for (MCInst &CFI : CFIs)
++          BB->addInstruction(std::move(CFI));
++        ++TCFolds;
++        continue;
++      }
++      if (A.K == Action::CR) {
++        const bool WithCalls = RunPlans[A.Plan].G->WithCalls;
++        // The entry the run's calls had in the call-site table, if any: none
++        // has a landing pad.
++        std::optional<MCPlus::MCLandingPad> EH;
++        int64_t ArgsSize = -1;
++        bool EmitCFI = false;
++        if (WithCalls) {
++          for (uint32_t P = Begin; P < End; ++P) {
++            const MCInst &Inst = *(BB->begin() + P);
++            if (!BC.MIB->isCall(Inst))
++              continue;
++            if (const std::optional<MCPlus::MCLandingPad> Info =
++                    BC.MIB->getEHInfo(Inst)) {
++              EH = Info;
++              ArgsSize = std::max(ArgsSize, BC.MIB->getGnuArgsSize(Inst));
++            }
++          }
++          EmitCFI = BF.hasCFI() &&
++                    cfaKindAt(BC, FuncInfo[&BF], *BB, Begin) == CFAFromRSP;
++        }
++        eraseRange(BC, BB, Begin, End);
++        MCInst Call;
++        BC.MIB->createCall(Call, RunMaster(A.Plan), BC.Ctx.get());
++        if (!WithCalls) {
++          BB->insertInstruction(BB->begin() + Begin, std::move(Call));
++          ++CRFolds;
++          continue;
++        }
++        // push %rax; call <master>; lea 8(%rsp), %rsp. The CFI around the
++        // call is added once BOLT has fixed the CFI of the final layout
++        // (DeduBBCFI).
++        MCInst Push, Lea;
++        BC.MIB->createPushRegister(Push, C.rax().id(), 8);
++        BC.MIB->createStackPointerDecrement(Lea, 8, /*NoFlagsClobber=*/true);
++        if (EH) {
++          BC.MIB->addEHInfo(Call, *EH);
++          if (BF.usesGnuArgsSize())
++            BC.MIB->addGnuArgsSize(Call, std::max<int64_t>(ArgsSize, 0));
++        }
++        if (EmitCFI) {
++          BC.MIB->addAnnotation(Push, CFAAdjustAnnotation, int64_t(8));
++          BC.MIB->addAnnotation(Lea, CFAAdjustAnnotation, int64_t(-8));
++          ++CFIStubs;
++        }
++        auto It = BB->insertInstruction(BB->begin() + Begin, std::move(Lea));
++        It = BB->insertInstruction(It, std::move(Call));
++        BB->insertInstruction(It, std::move(Push));
++        ++CRFolds;
++        ++CRCallFolds;
++        continue;
++      }
++      // Save-and-Jump: the rest of the block becomes the return point.
++      BinaryBasicBlock *Tail =
++          splitBlockAt(BC, BF, BB, End, /*Fallthrough=*/false);
++      const MCSymbol *TailSym = BF.addEntryPoint(*Tail);
++      eraseRange(BC, BB, Begin, BB->size());
++      MCInst Lea, Jump;
++      BC.MIB->createLoadAddress(Lea, TailSym, BC.MIB->getX86R11(),
++                                BC.Ctx.get());
++      BC.MIB->createTailCall(Jump, RunMaster(A.Plan), BC.Ctx.get());
++      BB->addInstruction(std::move(Lea));
++      BB->addInstruction(std::move(Jump));
++      ++SJFolds;
++    }
++  }
++  for (auto &[BF, _] : Changed)
++    if (!BF->validateCFG())
++      return createFatalBOLTError(Twine("BOLT-ERROR: DeduBB: invalid CFG in ") +
++                                  BF->getPrintName() + "\n");
++
++  BC.outs() << "BOLT-INFO: DeduBB: " << Functions.size() << " functions ("
++            << Aliased << " aliased left alone), " << Blocks.size()
++            << " blocks\n"
++            << "BOLT-INFO: DeduBB tail-call endings: " << TCResult.Blocks
++            << " blocks with one; " << TCPlans.size() << " groups, " << TCFolds
++            << " folds (" << TCResult.WholeBlocks << " whole blocks), ~"
++            << TCResult.BytesSaved << " bytes\n"
++            << "BOLT-INFO: DeduBB runs: " << Runs.Runnable
++            << " instructions a master can run (" << SJRunnable
++            << " by Save-and-Jump), " << Runs.Candidates
++            << " candidates; Call-Return " << NumCRMasters << " groups, "
++            << CRFolds << " copies (" << CRCallFolds << " that call, "
++            << CFIStubs << " with CFI); Save-and-Jump " << NumSJMasters
++            << " groups, " << SJFolds << " copies; ~" << Runs.BytesSaved
++            << " bytes (" << Runs.SJBytesSaved << " by Save-and-Jump)\n"
++            << "BOLT-INFO: DeduBB calls: " << CallsMovable
++            << " a master can make; left out: " << CallsStackArgs
++            << " may take stack arguments, " << CallsLandingPad
++            << " have a landing pad, " << CallsCFAUnknown
++            << " where the CFA rule is unknown\n";
++  return Error::success();
++}
++
++// BOLT tracks a function's CFI state by the position of each CFI instruction
++// in the original program, and fixes it for the final layout in
++// FinalizeFunctions; the CFI of the stubs goes in after that, as BOLT's own
++// GNU_args_size does.
++Error DeduBBCFI::runOnFunctions(BinaryContext &BC) {
++  if (!BC.MIB->getAnnotationIndex(CFAAdjustAnnotation))
++    return Error::success();
++  uint64_t Added = 0;
++  for (auto &[Address, BF] : BC.getBinaryFunctions()) {
++    if (!BF.hasCFG())
++      continue;
++    for (BinaryBasicBlock &BB : BF) {
++      for (uint32_t P = 0; P < BB.size(); ++P) {
++        MCInst &Inst = *(BB.begin() + P);
++        if (!BC.MIB->hasAnnotation(Inst, CFAAdjustAnnotation))
++          continue;
++        const int64_t Adjust =
++            BC.MIB->getAnnotationAs<int64_t>(Inst, CFAAdjustAnnotation);
++        BC.MIB->removeAnnotation(Inst, CFAAdjustAnnotation);
++        BF.addCFIInstruction(
++            &BB, BB.begin() + P + 1,
++            MCCFIInstruction::createAdjustCfaOffset(nullptr, Adjust));
++        ++P;
++        ++Added;
++      }
++    }
++  }
++  BC.outs() << "BOLT-INFO: DeduBB: " << Added
++            << " CFI instructions added around Call-Return stubs\n";
++  return Error::success();
++}
