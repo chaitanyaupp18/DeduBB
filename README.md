@@ -160,8 +160,9 @@ clang_dedubb_binaries/Results/perf_clang_dedup.txt
 Original DeduBB contributions are licensed under the
 [Apache License 2.0](LICENSE), except where otherwise noted.
 
-The LLVM patch is provided under
-[Apache License 2.0 with LLVM Exceptions](LICENSE-LLVM).
-Upstream copyright and license notices are retained.
+The BOLT patch is provided under
+[Apache License 2.0 with LLVM Exceptions](LICENSE-LLVM), the license of
+BOLT and the rest of the LLVM Project. Upstream copyright and license
+notices are retained.
 
 See [NOTICE](NOTICE) for attribution.

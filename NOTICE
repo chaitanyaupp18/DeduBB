@@ -12,5 +12,5 @@ Sriraman Tallam, Han Shen, and Xinliang David Li.
 LCTES 2026.
 https://doi.org/10.1145/3814943.3816169
 
-This repository includes patches to LLVM and Propeller.
-Upstream code retains its original copyright and license notices.
+This branch includes a patch to BOLT, the LLVM Project's post-link
+optimizer. Upstream code retains its original copyright and license notices.
